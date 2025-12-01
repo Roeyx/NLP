@@ -152,3 +152,4 @@ for res in results:
     c = res['config']
     print(
         f"Model: {c['type'].upper()} | Units: {c['units']:3d} | Dropout: {c['dropout']:.1f} | Val Acc: {res['val_acc']:.4f}")
+
