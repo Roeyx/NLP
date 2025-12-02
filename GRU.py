@@ -247,6 +247,11 @@ class GRUModel:
         ])
         
         self.model = model
+        
+        # Check GPU device placement
+        if tf.config.list_physical_devices('GPU') and model.weights:
+            print(f"✓ Model created with {len(model.layers)} layers")
+        
         return model
     
     def train_freeze_thaw(self, X_train, y_train, X_val, y_val, 
@@ -268,7 +273,7 @@ class GRUModel:
             validation_data=(X_val, y_val),
             epochs=warmup_epochs,
             batch_size=batch_size,
-            verbose=0
+            verbose=1
         )
         
         # Phase 2: Fine-tune with unfrozen embeddings
@@ -290,7 +295,7 @@ class GRUModel:
             epochs=finetune_epochs,
             batch_size=batch_size,
             callbacks=callbacks,
-            verbose=0
+            verbose=1
         )
         
         return history1, history2
