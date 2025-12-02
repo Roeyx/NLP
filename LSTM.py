@@ -9,19 +9,34 @@ from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Embedding, LSTM, GRU, Dense, SpatialDropout1D, Bidirectional
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 from sklearn.preprocessing import LabelEncoder
+import kagglehub
+import os
 
 # ==========================================
 # 1. Setup & Configuration
 # ==========================================
-TRAIN_PATH = r"C:\Users\roeyn\Coding_Enviroment\NLP\Ex1\.venv\train.csv"
-VAL_PATH = r"C:\Users\roeyn\Coding_Enviroment\NLP\Ex1\.venv\validation.csv"
+TRAIN_PATH = r"C:\Users\roeyn\Coding_Enviroment\NLP\PythonProject\.venv\NLP\train.csv"
+VAL_PATH = r"C:\Users\roeyn\Coding_Enviroment\NLP\PythonProject\.venv\NLP\validation.csv"
+
 
 # Hyperparameters
-MAX_WORDS = 10000  # Max vocabulary size
+# The dataset has 15,214 unique words therefore we chose larger MAX_WORDS hyperparameter
+MAX_WORDS = 30000  # Max vocabulary size
 MAX_LEN = 100  # Max sequence length
 EMBED_DIM = 100  # Embedding dimension
 EPOCHS = 20
 BATCH_SIZE = 32
+
+# Download latest version from Kaggle
+path = kagglehub.dataset_download("bertcarremans/glovetwitter27b100dtxt")
+print("Path to dataset files:", path)
+
+# The dataset folder contains 'glove.twitter.27B.100d.txt'
+GLOVE_PATH = os.path.join(path, "glove.twitter.27B.100d.txt")
+print("Using GloVe file:", GLOVE_PATH)
+
+#the reason i used GLOVE it that it has
+
 
 
 # ==========================================
@@ -68,9 +83,35 @@ le = LabelEncoder() #makes an instance of the LabelEncoder class
 y_train = le.fit_transform(train_df['label']) #Learns all unique categories and then transform each category into a unique number
 y_val = le.transform(val_df['label'])
 
-print(f"Vocabulary Size: {len(tokenizer.word_index) + 1}")
+
+# But ONLY top 10,000 get unique indices (1 through 10,000)
+# Words ranked 10,001-15,214 → all become <OOV> token
+print(f"Vocabulary Size: {len(tokenizer.word_index) + 1}") # = 15214
 print(f"Training Shape: {X_train.shape}, Validation Shape: {X_val.shape}")
 
+#Embeding
+print("Loading GloVe Twitter embeddings...")
+embeddings_index = {}
+with open(GLOVE_PATH, encoding="utf8") as f:
+    for line in tqdm(f, desc="Loading GloVe vectors"):
+        values = line.rstrip().split(" ") #removes the newline at the end.  splits the line into a list on spaces.
+        word = values[0] #value[0] is the word
+        coefs = np.asarray(values[1:], dtype="float32") #values[1:] are all the numbers after the word (the 100 embedding components).
+        embeddings_index[word] = coefs #Stores the mapping in the dictionary.
+
+
+vocab_size = min(MAX_WORDS, len(tokenizer.word_index) + 1)
+embedding_matrix = np.zeros((vocab_size, EMBED_DIM), dtype="float32")
+
+for word, idx in tqdm(tokenizer.word_index.items(), total=len(tokenizer.word_index), desc="Building embedding matrix"):
+    if idx >= vocab_size:
+        continue
+    vec = embeddings_index.get(word) #tries to find that word’s pretrained vector.
+    #If found, we put it into the correct row of embedding_matrix:
+    #row idx gets the GloVe vector.
+    #If not found, that row stays all zeros (unknown in GloVe).
+    if vec is not None:
+        embedding_matrix[idx] = vec
 
 # ==========================================
 # 4. Model Building Function
@@ -82,74 +123,83 @@ def build_model(model_type='lstm', units=64, dropout=0.3):
     """
     model = Sequential() #create the model so when can later stuck layers on it
 
-    # Embedding Layer: mask_zero=True is key for variable length sequences!
-    model.add(Embedding(input_dim=min(MAX_WORDS, len(tokenizer.word_index) + 1),
-                        output_dim=EMBED_DIM,
-                        input_length=MAX_LEN,
-                        mask_zero=True))
+    model.add(Embedding(
+        input_dim=embedding_matrix.shape[0],  # vocab_size
+        output_dim=embedding_matrix.shape[1],  # EMBED_DIM - Each word index is mapped to an embedding vector of this dimension
+        weights=[embedding_matrix],
+        input_length=MAX_LEN, #This sets the expected length of each input sequence
+        mask_zero=True, #This tells the layer to ignore/pad zeros (used to fill out short sequences).
+        trainable=False  # or True if you want to fine-tune
+    ))
 
     # Spatial Dropout drops entire 1D feature maps (better for NLP)
     model.add(SpatialDropout1D(dropout))
+    #forcing the model not to over‑rely on any single embedding dimension and helping reduce overfitting in NLP
 
     # Recurrent Layer (Bidirectional allows learning from future context)
     if model_type == 'lstm':
         model.add(Bidirectional(LSTM(units, return_sequences=False)))
-    else:
-        model.add(Bidirectional(GRU(units, return_sequences=False)))
+        #return_sequences=False means the layer outputs just the final vector (not the output from each time step).
 
     # Output Layer
-    model.add(Dense(6, activation='softmax'))
+    model.add(Dense(6, activation='softmax')) #there are 6 classes so we use 6 output units
 
-    model.compile(optimizer='adam',
-                  loss='sparse_categorical_crossentropy',
-                  metrics=['accuracy'])
+    model.compile(optimizer='adam', #Adam is the algorithm that updates the model's weights to reduce error.
+                  loss='sparse_categorical_crossentropy', #This specific loss is used for multi-class classification when your labels are integers
+                  metrics=['accuracy']) #make sure that our metric to evaluate the model results is accuracy
     return model
 
 
 # ==========================================
 # 5. Training Loop with TQDM & Callbacks
 # ==========================================
-configs = [
-    {'type': 'lstm', 'units': 64, 'dropout': 0.2},
-    {'type': 'lstm', 'units': 128, 'dropout': 0.4},
-]
 
 results = []
 
-print("\nStarting Training Loop...")
-for config in configs:
-    print(f"\nTraining {config['type'].upper()} (Units: {config['units']}, Dropout: {config['dropout']})")
+print("\n" + "=" * 60)
+print("LSTM HYPERPARAMETER GRID SEARCH")
+print("=" * 60)
 
-    model = build_model(model_type=config['type'], units=config['units'], dropout=config['dropout'])
+units_list = [16, 32, 64, 128, 256]
+dropout_list = np.arange(0.05, 0.55, 0.05)  # 0.05, 0.10, 0.15, ..., 0.50
 
-    # Callbacks to prevent overfitting and stuck learning
-    callbacks = [
-        EarlyStopping(monitor='val_loss', patience=3, restore_best_weights=True, verbose=1),
-        ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=2, min_lr=1e-5, verbose=1)
-    ]
+for units in tqdm(units_list, desc="Units loop", leave=True):
+    for dropout in tqdm(dropout_list, desc=f"Dropout for units={units}", leave=False):
 
-    # Keras handles the progress bar automatically, but we can wrap the fit call if needed.
-    # Standard Keras output is usually clear enough, but here is the standard execution.
-    history = model.fit(
-        X_train, y_train,
-        validation_data=(X_val, y_val),
-        epochs=EPOCHS,
-        batch_size=BATCH_SIZE,
-        callbacks=callbacks,
-        verbose=1
-    )
+        model = build_model(model_type='lstm', units=units, dropout=dropout)
 
-    best_acc = max(history.history['val_accuracy'])
-    results.append({'config': config, 'val_acc': best_acc})
+        callbacks = [
+            EarlyStopping(monitor='val_loss', patience=3, restore_best_weights=True, verbose=0),
+            ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=2, min_lr=1e-5, verbose=0)
+        ]
 
-# ==========================================
-# 6. Final Results
-# ==========================================
-print("\n" + "=" * 50)
+        # manual epoch loop so tqdm shows training progress
+        history = {'val_accuracy': []}
+        pbar = tqdm(range(EPOCHS), desc=f"Train (units={units}, drop={dropout:.2f})", leave=False)
+
+        for epoch in pbar:
+            hist = model.fit(
+                X_train, y_train,
+                validation_data=(X_val, y_val),
+                epochs=1,
+                batch_size=BATCH_SIZE,
+                callbacks=callbacks,
+                verbose=0
+            )
+
+            val_acc = hist.history['val_accuracy'][0]
+            history['val_accuracy'].append(val_acc)
+            pbar.set_postfix({'val_acc': f"{val_acc:.4f}"})
+
+        best_acc = max(history['val_accuracy'])
+        results.append({'units': units, 'dropout': dropout, 'val_acc': best_acc})
+        print(f"  → Best Val Acc: {best_acc:.4f}")
+
+# Print final summary table
+print("\n" + "=" * 60)
 print("FINAL RESULTS SUMMARY")
-print("=" * 50)
-for res in results:
-    c = res['config']
-    print(
-        f"Model: {c['type'].upper()} | Units: {c['units']:3d} | Dropout: {c['dropout']:.1f} | Val Acc: {res['val_acc']:.4f}")
+print("=" * 60)
+results.sort(key=lambda x: x['val_acc'], reverse=True)  # Sort by best accuracy
 
+for i, res in enumerate(results, 1):
+     print(f"{i:2d}. LSTM | Units: {res['units']:3d} | Dropout: {res['dropout']:.2f} | Val Acc: {res['val_acc']:.4f}")
