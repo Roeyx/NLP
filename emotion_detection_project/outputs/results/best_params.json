@@ -1,13 +1,9 @@
 {
-    "params": {
-      "dense_units": 256,
-      "dropout": 0.3,
-      "fine_tune_lr": 0.001,
-      "gru_units": 256,
-      "recurrent_dropout": 0.0,
-      "spatial_dropout": 0.2,
-      "warmup_lr": 0.01
-    },
-    "val_accuracy": 0.9375,
-    "time": 6.249755620956421
-  }
+  "dense_units": 128,
+  "dropout": 0.3,
+  "fine_tune_lr": 0.001,
+  "gru_units": 256,
+  "recurrent_dropout": 0.0,
+  "spatial_dropout": 0.2,
+  "warmup_lr": 0.01
+}
