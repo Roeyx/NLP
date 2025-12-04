@@ -6,7 +6,7 @@ import tensorflow as tf
 from tensorflow.keras.preprocessing.text import Tokenizer
 from tensorflow.keras.preprocessing.sequence import pad_sequences
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Embedding, LSTM, GRU, Dense, SpatialDropout1D, Bidirectional
+from tensorflow.keras.layers import Embedding, LSTM, Dense, SpatialDropout1D, Bidirectional
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 from sklearn.preprocessing import LabelEncoder
 import kagglehub
@@ -137,9 +137,9 @@ def build_model(model_type='lstm', units=64, dropout=0.3):
     #forcing the model not to over‑rely on any single embedding dimension and helping reduce overfitting in NLP
 
     # Recurrent Layer (Bidirectional allows learning from future context)
-    if model_type == 'lstm':
-        model.add(Bidirectional(LSTM(units, return_sequences=False)))
-        #return_sequences=False means the layer outputs just the final vector (not the output from each time step).
+    
+    model.add(Bidirectional(LSTM(units, return_sequences=False)))
+    #return_sequences=False means the layer outputs just the final vector (not the output from each time step).
 
     # Output Layer
     model.add(Dense(6, activation='softmax')) #there are 6 classes so we use 6 output units

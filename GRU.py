@@ -1,10 +1,9 @@
 """
 Bidirectional GRU Model for Emotion Classification
-Aligned with LSTM.py structure: Keras Tokenizer, inline embedding builder, reduced grid.
+
 """
 
 import os
-import sys
 import time
 
 # CRITICAL: Set LD_LIBRARY_PATH before importing TensorFlow
@@ -57,7 +56,7 @@ PARAM_GRID = {
     'gru_units': [128, 256],
     'dropout': [0.2, 0.3],
     'fine_tune_lr': [1e-3, 5e-4, 1e-4, 5e-5],
-    'warmup_lr': [1e-3], # fixed to reduce search space
+    'warmup_lr': [1e-3], 
     'spatial_dropout': [0.2],
     'dense_units': [64],
 }
@@ -101,10 +100,10 @@ def build_embedding_matrix(tokenizer_word_index, glove_path=GLOVE_FILE, embed_di
             continue
         vec = embeddings_index.get(word)
         if vec is not None:
+            #If not found, that row stays all zeros (unknown in GloVe).
             embedding_matrix[idx] = vec
             hits += 1
         else:
-            # Leave as zeros (match LSTM.py behavior)
             misses += 1
     
     print(f"Embedding matrix built: {hits} hits, {misses} misses (coverage: {hits/max(vocab_size,1):.2%})")
@@ -362,11 +361,10 @@ class GRUTrainer:
         predictions = model.predict(X_val, verbose=0)
         y_pred = np.argmax(predictions, axis=1)
         
-        # Explicit overall accuracy (useful in addition to classification report)
         acc = float(np.mean(y_pred == y_val))
         print(f"\nValidation accuracy: {acc:.4f}")
         
-        # Classification report printing removed; only final accuracy is displayed
+
         
         return y_pred
     
