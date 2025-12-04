@@ -170,11 +170,6 @@ class EmotionGRU(tf.keras.Model):
         )
         
         callbacks = [
-            EarlyStopping(
-                monitor='val_accuracy',
-                patience=3,
-                restore_best_weights=True
-            ),
             ReduceLROnPlateau(
                 monitor='val_loss',
                 factor=0.5,

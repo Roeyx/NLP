@@ -15,8 +15,10 @@ import os
 # ==========================================
 # 1. Setup & Configuration
 # ==========================================
-TRAIN_PATH = r"C:\Users\roeyn\Coding_Enviroment\NLP\PythonProject\.venv\NLP\train.csv"
-VAL_PATH = r"C:\Users\roeyn\Coding_Enviroment\NLP\PythonProject\.venv\NLP\validation.csv"
+# Configuration Constants
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+TRAIN_PATH = os.path.join(BASE_DIR, "train.csv")
+VAL_PATH = os.path.join(BASE_DIR, "validation.csv")
 
 
 # Hyperparameters
@@ -34,8 +36,6 @@ print("Path to dataset files:", path)
 # The dataset folder contains 'glove.twitter.27B.100d.txt'
 GLOVE_PATH = os.path.join(path, "glove.twitter.27B.100d.txt")
 print("Using GloVe file:", GLOVE_PATH)
-
-#the reason i used GLOVE it that it has
 
 
 

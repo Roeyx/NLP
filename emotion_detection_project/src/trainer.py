@@ -127,6 +127,13 @@ class GRUTrainer:
         grid = list(ParameterGrid(self.param_grid))
         total = len(grid)
         
+        # Load existing results (so summary includes previous runs) or start fresh
+        if os.path.exists(GRID_RESULTS_PATH):
+            with open(GRID_RESULTS_PATH, 'r') as f:
+                results = json.load(f)
+        else:
+            results = []
+        
         print(f"\n=== Grid Search: {total} combinations ===")
         print(f"Batch size: {self.batch_size}")
         print("⏳ Note: First iteration will be slow due to GPU warmup/compilation...")
@@ -155,8 +162,8 @@ class GRUTrainer:
                 
                 print(f"  ✓ Val Acc: {val_acc:.4f} (took {iter_time:.1f}s)")
                 
-                # Append result to JSON file
-                self._append_result_to_json(params, val_acc, iter_time)
+                # Append result to JSON file and update local results list
+                results = self._append_result_to_json(params, val_acc, iter_time, results)
                 
                 if val_acc > best_acc:
                     best_acc = val_acc
@@ -172,6 +179,9 @@ class GRUTrainer:
         print(f"BEST RESULT: {best_acc:.4f}")
         print(f"BEST PARAMS: {best_params}")
         print("=" * 50)
+        
+        # Print summary table
+        self._print_grid_search_summary(results)
         
         if best_params is None:
             raise RuntimeError(
@@ -256,6 +266,21 @@ class GRUTrainer:
         
         return y_pred
     
+    def _print_grid_search_summary(self, results):
+        """Print a summary table of grid search results."""
+        print("\n=== Grid Search Summary ===")
+        print(f"{'#':<3} | {'Val Acc':<10} | {'Time (s)':<10} | {'Params'}")
+        print("-" * 100)
+        
+        # Sort by accuracy descending
+        sorted_results = sorted(results, key=lambda x: x['val_accuracy'], reverse=True)
+        
+        for i, res in enumerate(sorted_results, 1):
+            # Format params to be more readable
+            params_str = ", ".join(f"{k}={v}" for k, v in res['params'].items())
+            print(f"{i:<3} | {res['val_accuracy']:.4f}     | {res['time']:.1f}       | {params_str}")
+        print("-" * 100)
+    
     def run_full_pipeline(self, train_path=TRAIN_PATH, val_path=VAL_PATH):
         """Run the complete training pipeline.
         
@@ -297,22 +322,26 @@ class GRUTrainer:
         
         return final_model, best_params
     
-    def _append_result_to_json(self, params, val_accuracy, time):
+    def _append_result_to_json(self, params, val_accuracy, time, existing_results=None):
         """Append a grid search result to the JSON file.
         
         Args:
             params: Dictionary of hyperparameters
             val_accuracy: Validation accuracy achieved
             time: Time taken for this iteration
+            existing_results: Optional existing results list to update
         """
         os.makedirs(RESULTS_DIR, exist_ok=True)
         
-        # Load existing results or create new list
-        if os.path.exists(GRID_RESULTS_PATH):
-            with open(GRID_RESULTS_PATH, 'r') as f:
-                results = json.load(f)
+        # Load existing results or use the provided one
+        if existing_results is not None:
+            results = existing_results
         else:
-            results = []
+            if os.path.exists(GRID_RESULTS_PATH):
+                with open(GRID_RESULTS_PATH, 'r') as f:
+                    results = json.load(f)
+            else:
+                results = []
         
         # Append new result
         results.append({
@@ -326,6 +355,8 @@ class GRUTrainer:
             json.dump(results, f, indent=2)
         
         print(f"  → Appended result to {GRID_RESULTS_PATH}")
+        
+        return results  # Return updated results list
     
     def _save_best_params(self, params):
         """Save best parameters to JSON file."""
