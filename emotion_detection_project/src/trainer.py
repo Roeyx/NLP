@@ -56,10 +56,12 @@ class GRUTrainer:
         self.preprocessor = TextPreprocessor()
         self.best_params = None
         self.best_model = None
-        self.batch_size = BATCH_SIZE
+        # Determine batch size based on GPU availability
+        self.batch_size = BATCH_SIZE if setup_gpu() else 32
         
-        # Setup GPU
-        self.has_gpu, _ = setup_gpu()
+        
+
+        
     
     def load_data(self, train_path=TRAIN_PATH, val_path=VAL_PATH):
         """Load and preprocess training and validation data.

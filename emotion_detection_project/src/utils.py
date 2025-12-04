@@ -56,7 +56,6 @@ def setup_gpu():
     """
     gpus = tf.config.list_physical_devices('GPU')
     has_gpu = len(gpus) > 0
-    batch_size = 1024 if has_gpu else 32
     
     if has_gpu:
         print(f"✅ GPU Detected: {len(gpus)} device(s)")
@@ -65,12 +64,11 @@ def setup_gpu():
                 tf.config.experimental.set_memory_growth(gpu, True)
             except RuntimeError as e:
                 print(f"⚠️  GPU memory growth setting failed: {e}")
-        print(f"✓ Set BATCH_SIZE = {batch_size} (GPU-optimized)")
+
     else:
         print(f"⚠️ No GPU detected")
-        print(f"✓ Set BATCH_SIZE = {batch_size} (CPU-optimized)")
     
-    return has_gpu, batch_size
+    return has_gpu
 
 
 def ensure_dirs():
