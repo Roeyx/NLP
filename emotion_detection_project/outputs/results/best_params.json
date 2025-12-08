@@ -1,9 +1,0 @@
-{
-  "dense_units": 128,
-  "dropout": 0.3,
-  "fine_tune_lr": 0.001,
-  "gru_units": 256,
-  "recurrent_dropout": 0.0,
-  "spatial_dropout": 0.2,
-  "warmup_lr": 0.01
-}
