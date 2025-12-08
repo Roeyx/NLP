@@ -31,35 +31,59 @@ VAL_PATH = os.path.join(BASE_DIR, "validation.csv")
 
 # Download latest version from Kaggle
 path = kagglehub.dataset_download("bertcarremans/glovetwitter27b100dtxt")
-print("Path to dataset files:", path)
 
 # The dataset folder contains 'glove.twitter.27B.100d.txt'
 GLOVE_FILE = os.path.join(path, "glove.twitter.27B.100d.txt")
-print("Using GloVe file:", GLOVE_FILE)
 
 MAX_WORDS = 30000
 MAX_LEN = 100 
 EMBED_DIM = 100  
 
+# Training epochs parameters for fine-tuning phase
 GRID_WARMUP_EPOCHS = 2
 GRID_FINETUNE_EPOCHS = 3
 FINAL_WARMUP_EPOCHS = 5
 FINAL_FINETUNE_EPOCHS = 15
+
+# Baseline config to match LSTM.py settings
+BASELINE_CONFIG = {
+    'batch_size': 32, 
+    'epochs': 20,                       
+}
+
+# LSTM parity constants — exact units and dropout ranges used in LSTM.py
+LSTM_PARITY_UNITS = [16, 32, 64, 128, 256]
+LSTM_PARITY_DROPOUT = list(np.arange(0.05, 0.55, 0.05))
 
 LABEL_MAP = {
     0: 'sadness', 1: 'joy', 2: 'love',
     3: 'anger', 4: 'fear', 5: 'surprise'
 }
 
-# Grid: 2 units × 2 dropout × 4 LRs = 16 combos
-PARAM_GRID = {
-    'gru_units': [128, 256],
-    'dropout': [0.2, 0.3],
-    'fine_tune_lr': [1e-3, 5e-4, 1e-4, 5e-5],
-    'warmup_lr': [1e-3], 
+# Phase 1 Grid: LSTM parity — 5 units × 10 dropout = 50 combos
+PHASE1_PARAM_GRID = {
+    # use the LSTM parity units/dropout by default — Phase 1 must match LSTM's grid
+    'gru_units': LSTM_PARITY_UNITS,
+    'dropout': LSTM_PARITY_DROPOUT,
     'spatial_dropout': [0.2],
     'dense_units': [64],
 }
+
+# Phase 2 Grid for freeze-thaw optimization (engineering phase)
+PHASE2_PARAM_GRID = {
+    'gru_units': [128, 256],
+    'dropout': [0.2, 0.3],
+    'fine_tune_lr': [1e-3, 5e-4, 1e-4, 5e-5],
+    'warmup_lr': [1e-3],
+    'spatial_dropout': [0.2],
+    'dense_units': [64],
+}
+
+# Phase 2 uses larger batch size for optimization
+PHASE2_BATCH_SIZE = 128
+
+# Output formatting
+SEPARATOR = '=' * 70
 
 
 def clean_text(text):
@@ -123,77 +147,120 @@ class GRUModel:
         self.dense_units = dense_units
         self.model = None
     
-    def build_model(self):
-        """Build the bidirectional GRU model architecture."""
-        model = Sequential([
+    def build_model(self, use_extra_dense: bool = True, trainable_embeddings: bool = True):
+        """Build the bidirectional GRU model architecture.
+        Args:
+            use_extra_dense (bool): Whether to include the intermediate dense + dropout layers (optimized GRU).
+            trainable_embeddings (bool): Whether to allow training of embedding layer.
+        """
+        layers = [
             Embedding(
                 input_dim=self.vocab_size,
                 output_dim=self.embedding_matrix.shape[1],
                 weights=[self.embedding_matrix],
                 input_length=MAX_LEN,
-                trainable=True,  # Enable fine-tuning
+                trainable=trainable_embeddings,
                 mask_zero=True
             ),
             SpatialDropout1D(self.spatial_dropout),
             Bidirectional(GRU(self.gru_units, return_sequences=False)),
-            Dense(self.dense_units, activation='relu'),
-            Dropout(self.dropout),
-            Dense(len(LABEL_MAP), activation='softmax')
-        ])
+        ]
+        # optional extra dense + dropout for fine tuning
+        if use_extra_dense:
+            layers += [
+                Dense(self.dense_units, activation='relu'),
+                Dropout(self.dropout),
+            ]
+
+        # output layer
+        layers += [Dense(len(LABEL_MAP), activation='softmax')]
+
+        model = Sequential(layers)
         
         self.model = model
         return model
     
     def train_freeze_thaw(self, X_train, y_train, X_val, y_val, 
                          warmup_epochs, finetune_epochs, warmup_lr, fine_tune_lr, batch_size):
-         """Train model using freeze-thaw strategy."""
-         if self.model is None:
-             self.build_model()
-         
-         # Phase 1: Warmup with frozen embeddings
-         self.model.layers[0].trainable = False
-         self.model.compile(
-             optimizer=Adam(learning_rate=warmup_lr),
-             loss='sparse_categorical_crossentropy',
-             metrics=['accuracy']
-         )
-         
-         history1 = self.model.fit(
-             X_train, y_train,
-             validation_data=(X_val, y_val),
-             epochs=warmup_epochs,
-             batch_size=batch_size,
-             verbose=1
-         )
-         
-         # Phase 2: Fine-tune with unfrozen embeddings
-         self.model.layers[0].trainable = True
-         self.model.compile(
+        """Train model using freeze-thaw strategy for fine tuning."""
+        if self.model is None:
+            self.build_model()
+        
+        # Phase 1: Warmup with frozen embeddings
+        self.model.layers[0].trainable = False
+        self.model.compile(
+            optimizer=Adam(learning_rate=warmup_lr),
+            loss='sparse_categorical_crossentropy',
+            metrics=['accuracy']
+        )
+        
+        history1 = self.model.fit(
+            X_train, y_train,
+            validation_data=(X_val, y_val),
+            epochs=warmup_epochs,
+            batch_size=batch_size,
+            verbose=1
+        )
+        
+        # Phase 2: Fine-tune with unfrozen embeddings
+        self.model.layers[0].trainable = True
+        self.model.compile(
             optimizer=Adam(learning_rate=fine_tune_lr),
-             loss='sparse_categorical_crossentropy',
-             metrics=['accuracy']
-         )
-         
-         callbacks = [
-             EarlyStopping(monitor='val_accuracy', patience=2, restore_best_weights=True),
-             ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=1, min_lr=1e-6)
-         ]
-         
-         history2 = self.model.fit(
-             X_train, y_train,
-             validation_data=(X_val, y_val),
-             epochs=finetune_epochs,
-             batch_size=batch_size,
-             callbacks=callbacks,
-             verbose=1
-         )
-         
-         return history1, history2
-    
-    def evaluate(self, X_val, y_val):
-        """Evaluate model on validation data."""
-        loss, acc = self.model.evaluate(X_val, y_val, verbose=0)
-        return loss, acc
+            loss='sparse_categorical_crossentropy',
+            metrics=['accuracy']
+        )
+        
+        callbacks = [
+            EarlyStopping(monitor='val_accuracy', patience=2, restore_best_weights=True),
+            ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=1, min_lr=1e-6)
+        ]
+        
+        history2 = self.model.fit(
+            X_train, y_train,
+            validation_data=(X_val, y_val),
+            epochs=finetune_epochs,
+            batch_size=batch_size,
+            callbacks=callbacks,
+            verbose=1
+        )
+        
+        return history1, history2
+
+    def train_baseline(self, X_train, y_train, X_val, y_val, batch_size, epochs):
+        """Train model in single-phase baseline mode 
+
+        Uses standard Adam optimizer and callbacks:
+            - EarlyStopping(monitor='val_loss', patience=3, restore_best_weights=True)
+            - ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=2, min_lr=1e-5)
+
+        Returns the Keras History object for the training run.
+        """
+        if self.model is None:
+            # Default to the 'use_extra_dense' and embedding options used when building
+            self.build_model()
+
+        # Compile with standard Adam optimizer (default lr=0.001)
+        self.model.compile(
+            optimizer=Adam(),
+            loss='sparse_categorical_crossentropy',
+            metrics=['accuracy']
+        )
+
+        callbacks = [
+            EarlyStopping(monitor='val_loss', patience=3, restore_best_weights=True, verbose=0),
+            ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=2, min_lr=1e-5, verbose=0)
+        ]
+
+        history = self.model.fit(
+            X_train, y_train,
+            validation_data=(X_val, y_val),
+            epochs=epochs,
+            batch_size=batch_size,
+            callbacks=callbacks,
+            verbose=1
+        )
+
+        return history
     
     def predict(self, X, **kwargs):
         """Make predictions."""
@@ -203,32 +270,18 @@ class GRUModel:
 class GRUTrainer:
     """Manages training pipeline including grid search and final training."""
     
-    def __init__(self, param_grid=PARAM_GRID):
+    def __init__(self, param_grid=PHASE1_PARAM_GRID):
         self.param_grid = param_grid
         self.best_params = None
         self.best_model = None
         self.grid_results = []
-        
-        # GPU setup: batch_size 256 if GPU else 32
-        gpus = tf.config.list_physical_devices('GPU')
-        self.has_gpu = len(gpus) > 0
-        
-        if self.has_gpu:
-            print(f"✅ GPU detected: {len(gpus)} device(s)")
-            for gpu in gpus:
-                try:
-                    tf.config.experimental.set_memory_growth(gpu, True)
-                except Exception:
-                    pass
-            self.batch_size = 256
-            print(f"✓ Batch size set to {self.batch_size} (GPU-optimized)")
-        else:
-            print(f"⚠️ No GPU detected. Running on CPU.")
-            self.batch_size = 32
-            print(f"✓ Batch size set to {self.batch_size} (CPU-optimized)")
+        # Ensure baseline batch/epochs is available to all training phases
+        self.batch_size = BASELINE_CONFIG['batch_size']
+        self.epochs = BASELINE_CONFIG['epochs']
+            
     
     def load_data(self, train_path=TRAIN_PATH, val_path=VAL_PATH):
-        """Load and preprocess data (Keras Tokenizer like LSTM.py)."""
+        """Load and preprocess data """
         print("\n=== Loading Data ===")
         train_df = pd.read_csv(train_path)
         val_df = pd.read_csv(val_path)
@@ -245,7 +298,7 @@ class GRUTrainer:
         X_train = pad_sequences(X_train_seq, maxlen=MAX_LEN, padding='post', truncating='post')
         X_val = pad_sequences(X_val_seq, maxlen=MAX_LEN, padding='post', truncating='post')
         
-        # Encode labels with LabelEncoder (match LSTM.py)
+        # Encode labels with LabelEncoder 
         le = LabelEncoder()
         y_train = le.fit_transform(train_df['label'])
         y_val = le.transform(val_df['label'])
@@ -256,20 +309,28 @@ class GRUTrainer:
         
         return X_train, y_train, X_val, y_val, tokenizer
     
-    def run_grid_search(self, X_train, y_train, X_val, y_val, embedding_matrix, vocab_size):
-        """Run grid search and store results in-memory."""
-        grid = list(ParameterGrid(self.param_grid))
+    def run_phase1_grid_search(self, X_train, y_train, X_val, y_val, embedding_matrix, vocab_size):
+        """Phase 1: Run grid search under LSTM baseline conditions for comparison."""
+        # Build Phase 1 grid (LSTM parity enforcement)
+        grid = list(ParameterGrid(PHASE1_PARAM_GRID))
         total = len(grid)
         
-        print(f"\n=== Grid Search: {total} combinations ===")
-        print("⏳ First iteration may be slow (GPU warmup)...")
+        print(f"\n{SEPARATOR}")
+        print(f"PHASE 1: BASELINE GRID SEARCH (LSTM Parity)")
+        print(f"{SEPARATOR}")
+        print(f"Grid size: {total} combinations")
+        print(f"Units: {LSTM_PARITY_UNITS}")
+        print(f"Dropout: [0.05, 0.10, ..., 0.50] (10 values)")
+        print(f"Batch size: {BASELINE_CONFIG['batch_size']}, Epochs: {BASELINE_CONFIG['epochs']}")
+        print(f"Embeddings: Static (trainable=False), Architecture: No extra dense layer")
+        print("⏳ First iteration may be slow (GPU warmup)...\n")
         
         best_acc = 0.0
         best_params = None
         self.grid_results = []
         
         for i, params in enumerate(grid, 1):
-            print(f"\n[{i}/{total}] {params}")
+            print(f"[{i}/{total}] Units={params['gru_units']}, Dropout={params['dropout']:.2f}")
             start = time.time()
             
             model = GRUModel(
@@ -279,51 +340,127 @@ class GRUTrainer:
                 spatial_dropout=params['spatial_dropout'],
                 dense_units=params['dense_units']
             )
-            model.build_model()
-            
-            model.train_freeze_thaw(
+            # Phase 1: Build model under baseline (static embeddings, no extra dense)
+            model.build_model(use_extra_dense=False,
+                              trainable_embeddings=False)
+
+            # Train using the fair baseline procedure
+            history = model.train_baseline(
                 X_train, y_train, X_val, y_val,
-                GRID_WARMUP_EPOCHS, GRID_FINETUNE_EPOCHS,
-                params.get('warmup_lr', 1e-3), params['fine_tune_lr'], self.batch_size
+                BASELINE_CONFIG['batch_size'], BASELINE_CONFIG['epochs']
             )
-            
-            _, val_acc = model.evaluate(X_val, y_val)
+
+            # Get best validation accuracy from history
+            val_accs = history.history.get('val_accuracy') or history.history.get('val_acc')
+            best_val_acc = max(val_accs)
             elapsed = time.time() - start
             
             result = {
                 'params': params,
-                'val_acc': float(val_acc),
+                'val_acc': float(best_val_acc),
                 'time_s': float(elapsed)
             }
             self.grid_results.append(result)
             
-            print(f"  → Val Acc: {val_acc:.4f} (took {elapsed:.1f}s)")
+            print(f"  → Val Acc: {best_val_acc:.4f} (took {elapsed:.1f}s)")
             
-            if val_acc > best_acc:
-                best_acc = val_acc
+            if best_val_acc > best_acc:
+                best_acc = best_val_acc
                 best_params = params
         
         self.best_params = best_params
-        self._print_grid_summary()
+        self._print_grid_summary(phase_name="Phase 1")
         
         return best_params
     
-    def _print_grid_summary(self):
+    def run_phase2_grid_search(self, X_train, y_train, X_val, y_val, embedding_matrix, vocab_size, phase1_best_units, phase1_best_dropout):
+        """Phase 2: Run freeze-thaw grid search with engineering optimizations."""
+        grid = list(ParameterGrid(PHASE2_PARAM_GRID))
+        total = len(grid)
+        
+        print(f"\n{SEPARATOR}")
+        print(f"PHASE 2: FREEZE-THAW OPTIMIZATION GRID SEARCH")
+        print(f"{SEPARATOR}")
+        print(f"Grid size: {total} combinations")
+        print(f"Units: {PHASE2_PARAM_GRID['gru_units']}")
+        print(f"Dropout: {PHASE2_PARAM_GRID['dropout']}")
+        print(f"Learning rates: {PHASE2_PARAM_GRID['fine_tune_lr']}")
+        print(f"Batch size: {PHASE2_BATCH_SIZE} (larger for optimization)")
+        print(f"Embeddings: Trainable (freeze-thaw), Architecture: With extra dense layer")
+        print(f"Using Phase 1 best baseline: Units={phase1_best_units}, Dropout={phase1_best_dropout:.2f}")
+        print("⏳ Running freeze-thaw training...\n")
+        
+        best_acc = 0.0
+        best_params = None
+        phase2_results = []
+        
+        for i, params in enumerate(grid, 1):
+            print(f"[{i}/{total}] Units={params['gru_units']}, Dropout={params['dropout']:.2f}, LR={params['fine_tune_lr']:.0e}")
+            start = time.time()
+            
+            model = GRUModel(
+                vocab_size, embedding_matrix,
+                gru_units=params['gru_units'],
+                dropout=params['dropout'],
+                spatial_dropout=params['spatial_dropout'],
+                dense_units=params['dense_units']
+            )
+            # Phase 2: Build with optimizations
+            model.build_model(use_extra_dense=True, trainable_embeddings=True)
+            
+            # Train using freeze-thaw
+            h1, h2 = model.train_freeze_thaw(
+                X_train, y_train, X_val, y_val,
+                GRID_WARMUP_EPOCHS, GRID_FINETUNE_EPOCHS,
+                params.get('warmup_lr', 1e-3), params['fine_tune_lr'], PHASE2_BATCH_SIZE
+            )
+            
+            # Get best validation accuracy from finetune history
+            val_accs = h2.history.get('val_accuracy') or h2.history.get('val_acc')
+            best_val_acc = max(val_accs)
+            elapsed = time.time() - start
+            
+            result = {
+                'params': params,
+                'val_acc': float(best_val_acc),
+                'time_s': float(elapsed)
+            }
+            phase2_results.append(result)
+            
+            print(f"  → Val Acc: {best_val_acc:.4f} (took {elapsed:.1f}s)")
+            
+            if best_val_acc > best_acc:
+                best_acc = best_val_acc
+                best_params = params
+        
+        # Store phase 2 results separately
+        self.phase2_results = phase2_results
+        self.phase2_best_params = best_params
+        
+        # Print Phase 2 summary
+        self.grid_results = phase2_results  # Temporarily set for printing
+        self._print_grid_summary(phase_name="Phase 2")
+        
+        return best_params
+    
+    def _print_grid_summary(self, phase_name="Phase 1"):
         """Print grid search results summary (sorted by accuracy)."""
-        print("\n" + "="*70)
-        print("GRID SEARCH RESULTS SUMMARY")
-        print("="*70)
+        print(f"\n{SEPARATOR}")
+        print(f"{phase_name.upper()} GRID SEARCH RESULTS SUMMARY")
+        print(SEPARATOR)
         
         sorted_results = sorted(self.grid_results, key=lambda x: x['val_acc'], reverse=True)
         
         for i, res in enumerate(sorted_results, 1):
             p = res['params']
-            print(f"{i:2d}. Val Acc: {res['val_acc']:.4f} | Units: {p['gru_units']:3d} | Dropout: {p['dropout']:.2f} | LR: {p['fine_tune_lr']:.0e} | Time: {res['time_s']:.1f}s")
+            # Handle optional keys gracefully
+            lr_str = f"| LR: {p['fine_tune_lr']:.0e}" if 'fine_tune_lr' in p else ""
+            print(f"{i:2d}. Val Acc: {res['val_acc']:.4f} | Units: {p['gru_units']:3d} | Dropout: {p['dropout']:.2f} {lr_str} | Time: {res['time_s']:.1f}s")
         
-        print("\n" + "="*70)
+        print(f"\n{SEPARATOR}")
         print(f"BEST: Val Acc {sorted_results[0]['val_acc']:.4f}")
         print(f"PARAMS: {sorted_results[0]['params']}")
-        print("="*70)
+        print(SEPARATOR)
     
     def train_final_model(self, X_train, y_train, X_val, y_val, 
                          embedding_matrix, vocab_size, params=None):
@@ -342,7 +479,9 @@ class GRUTrainer:
             spatial_dropout=params['spatial_dropout'],
             dense_units=params['dense_units']
         )
-        
+        # Build final model with engineering optimizations (trainable embeddings + extra dense)
+        model.build_model(use_extra_dense=True, trainable_embeddings=True)
+
         h1, h2 = model.train_freeze_thaw(
             X_train, y_train, X_val, y_val,
             FINAL_WARMUP_EPOCHS, FINAL_FINETUNE_EPOCHS,
@@ -350,8 +489,6 @@ class GRUTrainer:
         )
         
         self.best_model = model
-        
-        
         return model, h1, h2
     
     def evaluate_and_report(self, model, X_val, y_val):
@@ -364,12 +501,10 @@ class GRUTrainer:
         acc = float(np.mean(y_pred == y_val))
         print(f"\nValidation accuracy: {acc:.4f}")
         
-
-        
-        return y_pred
+        return y_pred, acc
     
     def run_full_pipeline(self, train_path=TRAIN_PATH, val_path=VAL_PATH):
-        """Run the complete training pipeline (results printed, minimal file output)."""
+        """Run the complete two-phase training pipeline."""
         # Load data
         X_train, y_train, X_val, y_val, tokenizer = self.load_data(train_path, val_path)
         
@@ -378,22 +513,55 @@ class GRUTrainer:
         vocab_size = min(MAX_WORDS, len(tokenizer.word_index) + 1)
         embedding_matrix = build_embedding_matrix(tokenizer.word_index)
         
-        # Grid search
-        best_params = self.run_grid_search(
+        # ========== PHASE 1: BASELINE GRID SEARCH (LSTM Parity) ==========
+        phase1_best_params = self.run_phase1_grid_search(
             X_train, y_train, X_val, y_val, embedding_matrix, vocab_size
         )
         
-        # Train final model
-        final_model, h1, h2 = self.train_final_model(
-            X_train, y_train, X_val, y_val, embedding_matrix, vocab_size, best_params
+        # Compute and display Phase 1 best result
+        phase1_best_val = None
+        if self.grid_results:
+            phase1_best_val = max(r['val_acc'] for r in self.grid_results)
+            print(f"\n{SEPARATOR}")
+            print(f"✅ PHASE 1 COMPLETE: Best Baseline Accuracy = {phase1_best_val:.4f}")
+            print(f"   Best hyperparameters: Units={phase1_best_params['gru_units']}, Dropout={phase1_best_params['dropout']:.2f}")
+            print(SEPARATOR)
+        
+        # ========== PHASE 2: FREEZE-THAW OPTIMIZATION GRID SEARCH ==========
+        phase2_best_params = self.run_phase2_grid_search(
+            X_train, y_train, X_val, y_val, embedding_matrix, vocab_size,
+            phase1_best_params['gru_units'], phase1_best_params['dropout']
         )
         
-        # Evaluate
-        self.evaluate_and_report(final_model, X_val, y_val)
+        # Compute and display Phase 2 best result
+        phase2_best_val = None
+        if hasattr(self, 'phase2_results') and self.phase2_results:
+            phase2_best_val = max(r['val_acc'] for r in self.phase2_results)
+            print(f"\n{SEPARATOR}")
+            print(f"✅ PHASE 2 COMPLETE: Best Optimized Accuracy = {phase2_best_val:.4f}")
+            print(f"   Best hyperparameters: Units={phase2_best_params['gru_units']}, Dropout={phase2_best_params['dropout']:.2f}, LR={phase2_best_params['fine_tune_lr']:.0e}")
+            print(SEPARATOR)
         
+        # ========== FINAL TRAINING with Phase 2 best params ==========
+        print(f"\n{SEPARATOR}")
+        print(f"FINAL TRAINING: Using Phase 2 best parameters")
+        print(SEPARATOR)
+        final_model, h1, h2 = self.train_final_model(
+            X_train, y_train, X_val, y_val, embedding_matrix, vocab_size, phase2_best_params
+        )
+        
+        # Final evaluation
+        y_pred, final_acc = self.evaluate_and_report(final_model, X_val, y_val)
+        
+        print(f"\n{SEPARATOR}")
+        print(f"🎯 FINAL MODEL ACCURACY: {final_acc:.4f}")
+        print(f"   Phase 1 (Baseline): {phase1_best_val:.4f}")
+        print(f"   Phase 2 (Optimized Grid): {phase2_best_val:.4f}")
+        print(f"   Final (Extended Training): {final_acc:.4f}")
+        print(SEPARATOR)
         print("\n=== PIPELINE COMPLETE ===")
         
-        return final_model, best_params
+        return final_model, {'phase1': phase1_best_params, 'phase2': phase2_best_params}
 
 
 def main():
