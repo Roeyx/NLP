@@ -1,9 +1,27 @@
+# Emotion Classification with BERT-based Models
+# Python >= 3.8 required
+
+# Core ML frameworks
 torch>=2.0.0
 transformers>=4.30.0
+
+# Quantization (BitsAndBytes for INT8 with LLM.int8() outlier handling)
+bitsandbytes>=0.41.0
+accelerate>=0.25.0
+
+# Data processing
 pandas>=1.5.0
 numpy>=1.23.0
+
+# Evaluation metrics
 scikit-learn>=1.2.0
+
+# Visualization
 matplotlib>=3.7.0
 seaborn>=0.12.0
-imbalanced-learn>=0.11.0
+
+# Utilities
 tqdm>=4.65.0
+
+# Note: imbalanced-learn removed (not used in final code)
+# Class imbalance handled via weighted CrossEntropyLoss
