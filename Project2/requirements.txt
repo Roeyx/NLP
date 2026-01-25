@@ -22,6 +22,7 @@ seaborn>=0.12.0
 
 # Utilities
 tqdm>=4.65.0
+emoji>=0.6.0
 
 # Note: imbalanced-learn removed (not used in final code)
 # Class imbalance handled via weighted CrossEntropyLoss

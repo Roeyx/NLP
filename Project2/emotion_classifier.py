@@ -12,15 +12,10 @@ Usage:
         python emotion_classifier.py --model BERTweet --output ./outputs
 
     Inference on test set:
-        python emotion_classifier.py --mode inference --weights best_ModernBERT.pt --test_csv test.csv
+        python emotion_classifier.py --mode inference --weights outputs/best_CardiffRoBERTa.pt --test_csv test.csv
 
     Compression analysis:
-        python emotion_classifier.py --mode compress --weights best_ModernBERT.pt --val validation.csv
-
-    In-code:
-        from emotion_classifier import main, run_inference, compress_and_evaluate
-        main(train_path='train.csv', val_path='validation.csv', output_dir='./outputs')
-        predictions = run_inference('best_ModernBERT.pt', 'test.csv')
+        python emotion_classifier.py --mode compress --weights outputs/best_CardiffRoBERTa.pt --val validation.csv
 
 Requirements:
     - Python >= 3.8
@@ -28,68 +23,51 @@ Requirements:
     - GPU recommended (CUDA), CPU fallback supported
 """
 
+import os
+import gc
+import re
+import time
+import json
+import argparse
+import warnings
+import tempfile
+from collections import Counter
+
 import pandas as pd
 import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from tqdm.auto import tqdm
+import emoji
+
 import torch
 import torch.nn as nn
 import torch.nn.utils.prune as prune
 from torch.utils.data import Dataset, DataLoader
 from torch.optim import AdamW
-from transformers import AutoTokenizer, AutoModelForSequenceClassification, get_linear_schedule_with_warmup
-from sklearn.metrics import (accuracy_score, classification_report, confusion_matrix,
-                             f1_score, precision_score, recall_score)
-import matplotlib.pyplot as plt
-import seaborn as sns
-import warnings
-import time
-from tqdm.auto import tqdm
-import re
-from collections import Counter
-import json
-import gc
-import os
-import argparse
 
+from transformers import (
+    AutoTokenizer, 
+    AutoModelForSequenceClassification, 
+    get_linear_schedule_with_warmup,
+)
+from sklearn.metrics import (
+    accuracy_score, 
+    classification_report, 
+    confusion_matrix,
+    f1_score, 
+    precision_score, 
+    recall_score,
+    precision_recall_curve,
+    average_precision_score
+)
+
+# Suppress warnings for cleaner output
 warnings.filterwarnings('ignore')
 
-# Set random seeds for reproducibility
-SEED = 42
-np.random.seed(SEED)
-torch.manual_seed(SEED)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed_all(SEED)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
 # ==================== CONFIGURATION ====================
-# Default device - can be overridden via CLI --gpu argument
+SEED = 42
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-
-def set_device(gpu_id: int = None):
-    """
-    Set the compute device.
-    
-    Args:
-        gpu_id: GPU device ID (0, 1, etc.) or None for auto-detect
-    
-    Returns:
-        torch.device
-    """
-    global DEVICE
-    if gpu_id is not None and torch.cuda.is_available():
-        if gpu_id < torch.cuda.device_count():
-            DEVICE = torch.device(f'cuda:{gpu_id}')
-            torch.cuda.set_device(gpu_id)
-        else:
-            print(f"⚠️ GPU {gpu_id} not available. Using GPU 0.")
-            DEVICE = torch.device('cuda:0')
-    elif torch.cuda.is_available():
-        DEVICE = torch.device('cuda:0')
-    else:
-        DEVICE = torch.device('cpu')
-    return DEVICE
-
 
 EMOTION_LABELS = {
     0: "Sadness",
@@ -107,55 +85,197 @@ MODELS = {
 }
 
 # Hyperparameters
-BATCH_SIZE = 32  # Reduce to 16 if OOM
+BATCH_SIZE = 32
 EPOCHS = 5
 LEARNING_RATE = 5e-5
 MAX_LENGTH = 128
 WARMUP_STEPS = 500
 WEIGHT_DECAY = 0.01
 
-# INT8 Quantization uses BitsAndBytes LLM.int8() with outlier handling
-# Threshold of 6.0 keeps outlier activations in FP16 for accuracy preservation
 
-
-def _print_config(gpu_id=None):
-    """Print configuration info. Called only when running as script."""
-    print(f"Using device: {DEVICE}")
+# ==================== UTILITIES ====================
+def set_global_seed(seed=SEED):
+    """Set random seeds for reproducibility across all libraries."""
+    np.random.seed(seed)
+    torch.manual_seed(seed)
     if torch.cuda.is_available():
-        device_idx = gpu_id if gpu_id is not None else 0
-        if device_idx < torch.cuda.device_count():
-            print(f"GPU {device_idx}: {torch.cuda.get_device_name(device_idx)}")
-        print(f"CUDA Version: {torch.version.cuda}")
-        print(f"Available GPUs: {torch.cuda.device_count()}")
-    print("\n⚙️ Configuration:")
-    print(f" Batch Size: {BATCH_SIZE}")
-    print(f" Max Length: {MAX_LENGTH}")
-    print(f" Epochs: {EPOCHS}")
-    print(f" Learning Rate: {LEARNING_RATE}")
-    print(f" Warmup Steps: {WARMUP_STEPS}")
-    print(f" Weight Decay: {WEIGHT_DECAY}")
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+
+def load_checkpoint_metadata(weights_path, device=None):
+    """
+    Robustly load checkpoint and extract metadata.
+    Handles (metadata dict) formats.
+    """
+    device = device or 'cpu' # Safer to load metadata on CPU
+    print(f"Loading checkpoint: {weights_path}")
+    
+    try:
+        checkpoint = torch.load(weights_path, map_location=device)
+    except FileNotFoundError:
+        raise FileNotFoundError(f"Checkpoint not found at: {weights_path}")
+
+    metadata = {
+        'model_id': None,
+        'config': {'max_length': MAX_LENGTH},
+        'state_dict': None
+    }
+
+    # Checkpoint format assignment
+    metadata['state_dict'] = checkpoint['model_state_dict']
+    metadata['model_id'] = checkpoint.get('model_id')
+    metadata['config'] = checkpoint.get('config', {})
+    print(f"  Format: Metadata-Rich (Model ID: {metadata['model_id']})")
+
+    return metadata
+
+
+def get_model_size_mb(model):
+    """Calculate model size in MB by saving to a temp file."""
+    with tempfile.NamedTemporaryFile() as tmp:
+        torch.save(model.state_dict(), tmp.name)
+        size_mb = os.path.getsize(tmp.name) / (1024 * 1024)
+    return size_mb
+
+
+# ==================== VISUALIZATION UTILS ====================
+class VisualizationUtils:
+    """Centralized plotting utilities for creating figures."""
+    
+    @staticmethod
+    def plot_class_distribution(labels, output_dir):
+        """Plot bar chart of class distribution (Imbalance check)."""
+        counts = Counter(labels)
+        labels_ordered = [EMOTION_LABELS[i] for i in sorted(EMOTION_LABELS.keys())]
+        values_ordered = [counts[i] for i in sorted(EMOTION_LABELS.keys())]
+        
+        plt.figure(figsize=(10, 6))
+        bars = plt.bar(labels_ordered, values_ordered, color='#3498db')
+        plt.title('Class Distribution (Training Data)', fontsize=14)
+        plt.xlabel('Emotion')
+        plt.ylabel('Number of Samples')
+        plt.grid(axis='y', alpha=0.3)
+        
+        # Add count labels
+        for bar in bars:
+            height = bar.get_height()
+            plt.text(bar.get_x() + bar.get_width()/2., height,
+                     f'{int(height)}', ha='center', va='bottom')
+            
+        out_path = os.path.join(output_dir, 'class_distribution.png')
+        plt.savefig(out_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"📊 Class distribution plot saved: {out_path}")
+
+    @staticmethod
+    def plot_confusion_matrix(y_true, y_pred, model_name, output_dir):
+        """Plot and save confusion matrix."""
+        cm = confusion_matrix(y_true, y_pred)
+        plt.figure(figsize=(10, 8))
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                    xticklabels=list(EMOTION_LABELS.values()),
+                    yticklabels=list(EMOTION_LABELS.values()))
+        plt.xlabel('Predicted Label')
+        plt.ylabel('True Label')
+        plt.title(f'{model_name} - Confusion Matrix')
+        
+        safe_name = re.sub(r'[^\w\-_]', '_', model_name)
+        out_path = os.path.join(output_dir, f'{safe_name}_confusion_matrix.png')
+        plt.savefig(out_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"📉 Confusion matrix saved: {out_path}")
+
+    @staticmethod
+    def plot_training_curves(history, model_name, output_dir):
+        """Plot loss and accuracy curves."""
+        epochs = range(1, len(history['train_loss']) + 1)
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+        
+        # Loss
+        axes[0].plot(epochs, history['train_loss'], 'b-o', label='Train Loss')
+        axes[0].plot(epochs, history['val_loss'], 'r-o', label='Val Loss')
+        axes[0].set_title(f'{model_name} - Loss')
+        axes[0].set_xlabel('Epoch')
+        axes[0].set_ylabel('Loss')
+        axes[0].legend()
+        axes[0].grid(True, alpha=0.3)
+        
+        # Accuracy
+        axes[1].plot(epochs, history['val_acc'], 'g-o', label='Val Acc')
+        axes[1].set_title(f'{model_name} - Accuracy')
+        axes[1].set_xlabel('Epoch')
+        axes[1].set_ylabel('Accuracy')
+        axes[1].set_ylim([0, 1])
+        axes[1].grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        safe_name = re.sub(r'[^\w\-_]', '_', model_name)
+        out_path = os.path.join(output_dir, f'{safe_name}_training_curves.png')
+        plt.savefig(out_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"📈 Training curves saved: {out_path}")
+
+    @staticmethod
+    def plot_pr_curves(y_true, y_logits, model_name, output_dir):
+        """
+        Plot Precision-Recall curves for all classes.
+        Essential for imbalanced datasets.
+        """
+        # Convert true labels to one-hot
+        n_classes = len(EMOTION_LABELS)
+        y_true_onehot = np.eye(n_classes)[y_true]
+        
+        # Softmax logits to get probabilities
+        y_probs = torch.softmax(torch.tensor(y_logits), dim=1).numpy()
+        
+        plt.figure(figsize=(10, 8))
+        
+        for i in range(n_classes):
+            precision, recall, _ = precision_recall_curve(y_true_onehot[:, i], y_probs[:, i])
+            avg_precision = average_precision_score(y_true_onehot[:, i], y_probs[:, i])
+            plt.plot(recall, precision, lw=2, 
+                     label=f'{EMOTION_LABELS[i]} (AP={avg_precision:.2f})')
+            
+        plt.xlabel('Recall')
+        plt.ylabel('Precision')
+        plt.title(f'{model_name} - Precision-Recall Curves')
+        plt.legend(loc="best")
+        plt.grid(True, alpha=0.3)
+        
+        safe_name = re.sub(r'[^\w\-_]', '_', model_name)
+        out_path = os.path.join(output_dir, f'{safe_name}_pr_curves.png')
+        plt.savefig(out_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"📊 PR Curves saved: {out_path}")
 
 
 # ==================== DATA CLEANER ====================
 class DataCleaner:
-    """Utilities to sanitize and filter raw text data."""
+    """Utilities to clean and filter raw text data."""
     
     @staticmethod
     def clean_text(text):
         """Remove URLs, emails, mentions, hashtags, non-ascii chars."""
         if not isinstance(text, str):
             return ""
+        
+        # 1. Demojize: Convert emojis to text (e.g. 😂 -> " joy ")
+        text = emoji.demojize(text, delimiters=(" ", " "))
+        
         text = re.sub(r'http\S+|www.\S+', '', text)
         text = re.sub(r'\S+@\S+', '', text)
         text = re.sub(r'@\w+', '', text)
         text = re.sub(r'#(\w+)', r'\1', text)
+        
+        # 2. ASCII normalization (respects converted emojis)
         text = text.encode('ascii', 'ignore').decode('ascii')
         text = re.sub(r'\s+', ' ', text).strip()
         return text.lower()
 
     @staticmethod
     def remove_duplicates(df):
-        """Drop duplicate text entries."""
         initial = len(df)
         df = df.drop_duplicates(subset=['text'], keep='first')
         print(f" Removed {initial - len(df)} duplicates")
@@ -163,7 +283,6 @@ class DataCleaner:
 
     @staticmethod
     def remove_outliers(df, min_len=3, max_len=512):
-        """Filter by text length."""
         initial = len(df)
         df = df[(df['text'].str.len() >= min_len) & (df['text'].str.len() <= max_len)]
         print(f" Removed {initial - len(df)} outliers")
@@ -171,13 +290,12 @@ class DataCleaner:
 
     @staticmethod
     def handle_missing_values(df):
-        """Remove rows missing text or label."""
         return df.dropna(subset=['text', 'label'])
 
 
-# ==================== EMOTION DATASET ====================
+# ==================== DATASETS ====================
 class EmotionDataset(Dataset):
-    """PyTorch Dataset for emotion classification with labels."""
+    """PyTorch Dataset for training/validation (with labels)."""
     
     def __init__(self, texts, labels, tokenizer, max_length=128):
         self.texts = texts
@@ -206,7 +324,7 @@ class EmotionDataset(Dataset):
 
 
 class InferenceDataset(Dataset):
-    """PyTorch Dataset for inference without labels (external test sets)."""
+    """PyTorch Dataset for inference (test dataset)."""
     
     def __init__(self, texts, tokenizer, max_length=128):
         self.texts = texts
@@ -231,17 +349,9 @@ class InferenceDataset(Dataset):
         }
 
 
-# ==================== EMOTION CLASSIFIER ====================
+# ==================== CLASSIFIER CLASS ====================
 class EmotionClassifier:
-    """
-    Encapsulates a HuggingFace transformer for sequence classification.
-    
-    Features:
-    - Loads tokenizer and model with num_labels=6
-    - Supports class weights for imbalanced data
-    - Saves checkpoints with metadata for reproducibility
-    - Generates training curves visualization
-    """
+    """Encapsulates model training and evaluation logic."""
     
     def __init__(self, model_name, model_id, device, class_weights=None):
         self.model_name = model_name
@@ -249,7 +359,7 @@ class EmotionClassifier:
         self.device = device
         self.class_weights = class_weights
 
-        print(f"\nLoading {model_name}...")
+        print(f"\nInitializing {model_name} ({model_id})...")
         self.tokenizer = AutoTokenizer.from_pretrained(model_id)
         self.model = AutoModelForSequenceClassification.from_pretrained(
             model_id,
@@ -257,36 +367,31 @@ class EmotionClassifier:
             ignore_mismatched_sizes=True
         )
 
-        # Full fine-tuning: all params trainable
         trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-        total = sum(p.numel() for p in self.model.parameters())
-        print(f" 🔓 Full Fine-tuning: {trainable:,}/{total:,} ({100*trainable/total:.2f}%)")
+        print(f" Parameters: {trainable:,} trainable")
 
         self.model.to(device)
         self.history = {'train_loss': [], 'val_loss': [], 'val_acc': []}
         self.best_val_loss = float('inf')
-        self.train_time = 0
 
     def get_loss_fn(self):
-        """Get loss function with optional class weights."""
+        """Active Imbalance Handling: Use Weighted Cross Entropy."""
         if self.class_weights is not None:
             weights = torch.tensor(self.class_weights, dtype=torch.float).to(self.device)
             return nn.CrossEntropyLoss(weight=weights)
         return nn.CrossEntropyLoss()
 
     def train_epoch(self, train_loader, optimizer, scheduler, loss_fn):
-        """Train for one epoch."""
         self.model.train()
         total_loss = 0
-        for batch in tqdm(train_loader, desc=f"Training {self.model_name}", leave=False):
+        for batch in tqdm(train_loader, desc=f"Train {self.model_name}", leave=False):
             optimizer.zero_grad()
             input_ids = batch['input_ids'].to(self.device)
             attention_mask = batch['attention_mask'].to(self.device)
             labels = batch['labels'].to(self.device)
 
             outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
-            logits = outputs.logits
-            loss = loss_fn(logits, labels)
+            loss = loss_fn(outputs.logits, labels)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
             optimizer.step()
@@ -295,7 +400,6 @@ class EmotionClassifier:
         return total_loss / len(train_loader)
 
     def evaluate(self, val_loader, loss_fn):
-        """Evaluate on validation set."""
         self.model.eval()
         total_loss = 0
         all_preds, all_labels = [], []
@@ -306,345 +410,191 @@ class EmotionClassifier:
                 labels = batch['labels'].to(self.device)
 
                 outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
-                logits = outputs.logits
-                loss = loss_fn(logits, labels)
+                loss = loss_fn(outputs.logits, labels)
                 total_loss += loss.item()
 
-                preds = torch.argmax(logits, dim=1)
+                preds = torch.argmax(outputs.logits, dim=1)
                 all_preds.extend(preds.cpu().numpy())
                 all_labels.extend(labels.cpu().numpy())
         acc = accuracy_score(all_labels, all_preds)
         return total_loss / len(val_loader), acc, all_preds, all_labels
 
     def train(self, train_loader, val_loader, num_epochs=5, output_dir='./outputs'):
-        """
-        Full training loop with early stopping and checkpoint saving.
-        
-        Saves checkpoint with metadata for reproducibility.
-        """
+        """Train loop with checkpointing and metadata saving."""
         loss_fn = self.get_loss_fn()
         optimizer = AdamW(self.model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
-        total_steps = len(train_loader) * num_epochs
         scheduler = get_linear_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=WARMUP_STEPS,
-            num_training_steps=total_steps
+            optimizer, num_warmup_steps=WARMUP_STEPS, 
+            num_training_steps=len(train_loader) * num_epochs
         )
 
         patience = 3
         patience_counter = 0
-        start_time = time.time()
         ckpt_path = os.path.join(output_dir, f'best_{self.model_name}.pt')
 
         for epoch in range(num_epochs):
-            print(f"\nEpoch {epoch+1}/{num_epochs} - {self.model_name}")
-            epoch_start = time.time()
+            print(f"\nEpoch {epoch+1}/{num_epochs}")
             train_loss = self.train_epoch(train_loader, optimizer, scheduler, loss_fn)
             val_loss, val_acc, _, _ = self.evaluate(val_loader, loss_fn)
-            epoch_time = time.time() - epoch_start
-
+            
             self.history['train_loss'].append(train_loss)
             self.history['val_loss'].append(val_loss)
             self.history['val_acc'].append(val_acc)
-
-            print(f"Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f} | Time: {epoch_time:.1f}s")
+            
+            print(f" Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}")
 
             if val_loss < self.best_val_loss:
                 self.best_val_loss = val_loss
                 patience_counter = 0
-                # Save checkpoint with metadata (.pt format for portability)
+                
+                # Save robust checkpoint
                 torch.save({
                     'model_state_dict': self.model.state_dict(),
                     'model_id': self.model_id,
                     'model_name': self.model_name,
-                    'config': {
-                        'max_length': MAX_LENGTH,
-                        'num_labels': 6,
-                        'batch_size': BATCH_SIZE,
-                        'learning_rate': LEARNING_RATE,
-                        'weight_decay': WEIGHT_DECAY,
-                    },
+                    'config': {'max_length': MAX_LENGTH},
                     'val_loss': val_loss,
-                    'val_acc': val_acc,
-                    'epoch': epoch + 1,
+                    'val_acc': val_acc
                 }, ckpt_path)
                 
-                # Also save in HuggingFace format (for BitsAndBytes quantization compatibility)
-                hf_save_dir = ckpt_path.replace('.pt', '')  # e.g., outputs/best_BERTweet
-                self.model.save_pretrained(hf_save_dir)
-                self.tokenizer.save_pretrained(hf_save_dir)
-                
-                print(f" Saved checkpoint: {ckpt_path} (Val Loss: {val_loss:.4f})")
+                # Save HuggingFace format for Quantization support
+                hf_dir = ckpt_path.replace('.pt', '')
+                self.model.save_pretrained(hf_dir)
+                self.tokenizer.save_pretrained(hf_dir)
+                print(f" Saved Best Model: {ckpt_path}")
             else:
                 patience_counter += 1
-                print(f" Patience: {patience_counter}/{patience}")
                 if patience_counter >= patience:
-                    print(f"Early stopping (patience={patience})")
+                    print(" Early stopping triggered.")
                     break
 
-        self.train_time = time.time() - start_time
-        
-        # Load best checkpoint with backward compatibility
-        checkpoint = torch.load(ckpt_path, map_location=self.device)
-        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-            self.model.load_state_dict(checkpoint['model_state_dict'])
-        else:
-            self.model.load_state_dict(checkpoint)
-
-    def save_training_curves(self, output_dir):
-        """Save training loss and validation accuracy curves."""
-        vis_dir = os.path.join(output_dir, 'visualizations')
-        os.makedirs(vis_dir, exist_ok=True)
-        
-        fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-        epochs = range(1, len(self.history['train_loss']) + 1)
-        
-        # Loss curves
-        axes[0].plot(epochs, self.history['train_loss'], 'b-o', label='Train Loss', markersize=4)
-        axes[0].plot(epochs, self.history['val_loss'], 'r-o', label='Val Loss', markersize=4)
-        axes[0].set_xlabel('Epoch')
-        axes[0].set_ylabel('Loss')
-        axes[0].set_title(f'{self.model_name} - Loss Curves')
-        axes[0].legend()
-        axes[0].grid(True, alpha=0.3)
-        
-        # Accuracy curve
-        axes[1].plot(epochs, self.history['val_acc'], 'g-o', label='Val Accuracy', markersize=4)
-        axes[1].set_xlabel('Epoch')
-        axes[1].set_ylabel('Accuracy')
-        axes[1].set_title(f'{self.model_name} - Validation Accuracy')
-        axes[1].legend()
-        axes[1].grid(True, alpha=0.3)
-        axes[1].set_ylim([0, 1])
-        
-        plt.tight_layout()
-        curve_path = os.path.join(vis_dir, f'{self.model_name}_training_curves.png')
-        plt.savefig(curve_path, dpi=150, bbox_inches='tight')
-        plt.close()
-        print(f" 📈 Training curves saved: {curve_path}")
+        # Reload best weights
+        meta = load_checkpoint_metadata(ckpt_path, self.device)
+        self.model.load_state_dict(meta['state_dict'])
 
     def predict(self, test_loader):
-        """Run prediction and return metrics."""
-        print(f"\nPredicting on {len(test_loader.dataset)} samples using {self.model_name}...")
+        """Run full prediction for evaluation."""
         self.model.eval()
         all_preds, all_labels, all_logits = [], [], []
-        inference_times = []
+        times = []
         
         with torch.no_grad():
-            for batch in tqdm(test_loader, desc=f"Predict {self.model_name}", leave=False):
+            for batch in tqdm(test_loader, desc="Predicting"):
                 input_ids = batch['input_ids'].to(self.device)
                 attention_mask = batch['attention_mask'].to(self.device)
-                labels = batch['labels'].to(self.device)
+                labels = batch.get('labels')
+                if labels is not None:
+                    labels = labels.to(self.device)
 
                 start = time.time()
                 outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
-                elapsed = time.time() - start
-                inference_times.append(elapsed / len(labels))
+                times.append((time.time() - start) / len(input_ids))
 
                 logits = outputs.logits
                 preds = torch.argmax(logits, dim=1)
-                all_preds.extend(preds.cpu().numpy())
-                all_labels.extend(labels.cpu().numpy())
-                all_logits.extend(logits.cpu().numpy())
                 
-        avg_time = np.mean(inference_times) if inference_times else 0
-        print(f"Prediction complete. Avg inference: {avg_time*1000:.2f} ms/sample")
+                all_preds.extend(preds.cpu().numpy())
+                all_logits.extend(logits.cpu().numpy())
+                if labels is not None:
+                    all_labels.extend(labels.cpu().numpy())
+        
+        avg_time = np.mean(times) if times else 0
         return all_preds, all_labels, all_logits, avg_time
 
 
-# ==================== DATA LOADING HELPERS ====================
-def load_and_prepare_data(train_path='train.csv', val_path='validation.csv'):
-    """Load and preprocess CSV data."""
-    print("\n" + "="*50)
-    print("LOADING DATA")
-    print("="*50)
-    try:
-        train_df = pd.read_csv(train_path)
-        val_df = pd.read_csv(val_path)
-    except Exception as e:
-        print("Error: CSV files not found!", e)
-        return None, None
-
-    print(f"Loaded: {train_path} -> {len(train_df)} rows")
-    print(f"Loaded: {val_path} -> {len(val_df)} rows")
-    
-    cleaner = DataCleaner()
-    train_df = cleaner.handle_missing_values(train_df)
-    val_df = cleaner.handle_missing_values(val_df)
-    train_df['text'] = train_df['text'].apply(cleaner.clean_text)
-    val_df['text'] = val_df['text'].apply(cleaner.clean_text)
-    train_df = cleaner.remove_duplicates(train_df)
-    val_df = cleaner.remove_duplicates(val_df)
-    train_df = cleaner.remove_outliers(train_df)
-    val_df = cleaner.remove_outliers(val_df)
-
-    print(f"Cleaned: {len(train_df)} train, {len(val_df)} val")
-    return train_df, val_df
-
-
-def get_class_weights(labels):
-    """Compute class weights for imbalanced data."""
-    counts = Counter(labels)
-    total = len(labels)
-    counts_list = [counts.get(i, 0) for i in range(6)]
-    weights = [total / counts[i] for i in range(6)]
-    weights = np.array(weights)
-    weights = weights / weights.sum() * 6
-    print("Class counts:", counts_list)
-    print("Class weights:", np.round(weights, 4))
-    return weights
-
-
-def get_model_size_mb(model):
-    """Calculate model size in MB by saving to a temp file."""
-    import tempfile
-    with tempfile.NamedTemporaryFile() as tmp:
-        torch.save(model.state_dict(), tmp.name)
-        size_mb = os.path.getsize(tmp.name) / (1024 * 1024)
-    return size_mb
-
-
-# ==================== INFERENCE FUNCTION ====================
-def run_inference(weights: str, csv: str, model_id: str = None,
+# ==================== INFERENCE ====================
+def run_inference(weights: str, csv: str, model_id: str = None, 
                   text_column: str = 'text', output_csv: str = None) -> list:
     """
-    Run inference on external test set using trained weights.
-    
-    Args:
-        weights: Path to .pt checkpoint file
-        csv: Path to CSV file containing text data
-        model_id: HuggingFace model ID (optional if saved in checkpoint)
-        text_column: Name of text column in CSV (default: 'text')
-        output_csv: Path to save predictions (optional, auto-generated if None)
-    
-    Returns:
-        List of predicted label integers (0-5)
-    
-    Example:
-        predictions = run_inference('best_ModernBERT.pt', 'test.csv')
+    Inference Interface.
     """
-    print(f"\n{'='*50}")
-    print("RUNNING INFERENCE")
-    print(f"{'='*50}")
-    print(f" Weights: {weights}")
-    print(f" CSV: {csv}")
+    set_global_seed(SEED)
+    print(f"\n{'='*40}\nRUNNING INFERENCE\n{'='*40}")
     
-    # Load checkpoint with backward compatibility
-    checkpoint = torch.load(weights, map_location=DEVICE)
+    # 1. Load Metadata & Model
+    meta = load_checkpoint_metadata(weights, DEVICE)
     
-    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-        state_dict = checkpoint['model_state_dict']
-        saved_model_id = checkpoint.get('model_id')
-        max_length = checkpoint.get('config', {}).get('max_length', MAX_LENGTH)
-        model_id = model_id or saved_model_id
-        print(f" Checkpoint format: New (metadata included)")
-        print(f" Model ID: {saved_model_id}")
-    else:
-        state_dict = checkpoint
-        max_length = MAX_LENGTH
-        print(f" Checkpoint format: Legacy (state_dict only)")
+    # Use stored model_id if available, otherwise argument
+    resolved_model_id = meta['model_id'] or model_id
+    if not resolved_model_id:
+        raise ValueError("Model ID not found in checkpoint. Provide --model_id.")
     
-    if model_id is None:
-        raise ValueError(
-            "model_id is required. Either provide it as argument or use new checkpoint format.\n"
-            f"Available models: {list(MODELS.keys())}"
-        )
+    print(f" Model ID: {resolved_model_id}")
     
-    print(f" Using model_id: {model_id}")
-    print(f" Max length: {max_length}")
-    
-    # Load model and tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    tokenizer = AutoTokenizer.from_pretrained(resolved_model_id)
     model = AutoModelForSequenceClassification.from_pretrained(
-        model_id, num_labels=6, ignore_mismatched_sizes=True
+        resolved_model_id, num_labels=6, ignore_mismatched_sizes=True
     )
-    model.load_state_dict(state_dict)
+    model.load_state_dict(meta['state_dict'])
     model.to(DEVICE)
     model.eval()
     
-    # Load and preprocess CSV
-    df = pd.read_csv(csv)
-    print(f" Loaded {len(df)} rows")
+    # 2. Prepare Data
+    try:
+        df = pd.read_csv(csv)
+    except FileNotFoundError:
+        print(f"Error: File {csv} not found.")
+        return []
+        
+    print(f" Data: {len(df)} rows from {csv}")
+    
+    # Clean and Load
     df[text_column] = df[text_column].apply(DataCleaner.clean_text)
+    dataset = InferenceDataset(df[text_column], tokenizer, meta['config'].get('max_length', 128))
+    loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False)
     
-    # Create dataset and dataloader
-    dataset = InferenceDataset(df[text_column], tokenizer, max_length)
-    loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
-    
-    # Run inference
-    predictions = []
-    inference_times = []
-    
+    # 3. Predict
+    preds = []
     with torch.no_grad():
         for batch in tqdm(loader, desc="Inference"):
             input_ids = batch['input_ids'].to(DEVICE)
             attention_mask = batch['attention_mask'].to(DEVICE)
             
-            start = time.time()
             outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-            elapsed = time.time() - start
-            inference_times.append(elapsed)
+            batch_preds = torch.argmax(outputs.logits, dim=1)
+            preds.extend(batch_preds.cpu().numpy().tolist())
             
-            preds = torch.argmax(outputs.logits, dim=1)
-            predictions.extend(preds.cpu().numpy().tolist())
-    
-    avg_time = sum(inference_times) / len(predictions) * 1000
-    print(f"\n Inference complete: {len(predictions)} predictions")
-    print(f" Avg time: {avg_time:.2f} ms/sample")
-    
-    # Save predictions to CSV
+    # 4. Save
     if output_csv is None:
-        base_name = os.path.splitext(os.path.basename(csv))[0]
-        output_csv = f"{base_name}_predictions.csv"
-    
+        base = os.path.splitext(os.path.basename(csv))[0]
+        output_csv = f"{base}_predictions.csv"
+        
     result_df = df.copy()
-    result_df['predicted_label'] = predictions
-    result_df['predicted_emotion'] = [EMOTION_LABELS[p] for p in predictions]
+    result_df['predicted_label'] = preds
+    result_df['predicted_emotion'] = [EMOTION_LABELS[p] for p in preds]
     result_df.to_csv(output_csv, index=False)
-    print(f" Predictions saved: {output_csv}")
+    print(f" Predictions saved to: {output_csv}")
     
-    return predictions
+    return preds
 
 
-# ==================== MODEL COMPRESSION ====================
+# ==================== COMPRESSION ====================
 def apply_pruning(model, amount=0.3):
-    """
-    Apply unstructured L1 pruning to Linear layers.
-    
-    Args:
-        model: PyTorch model
-        amount: Fraction of weights to prune (default: 0.3 = 30%)
-    
-    Returns:
-        Pruned model (modified in-place)
-    """
+    """Apply unstructured L1 pruning to Linear layers."""
     pruned_count = 0
     for name, module in model.named_modules():
         if isinstance(module, nn.Linear):
             prune.l1_unstructured(module, name='weight', amount=amount)
-            prune.remove(module, 'weight')  # Make permanent
+            prune.remove(module, 'weight')
             pruned_count += 1
-    
     print(f"  Pruned {pruned_count} Linear layers at {amount*100:.0f}% sparsity")
     return model
 
 
-
-
-
 def evaluate_compressed_model(model, val_loader, name, device=None, output_dir=None):
-    """
-    Evaluate a model and return detailed metrics.
-    
-    Returns dict with accuracy, macro_f1, size_mb, inference_time_ms,
-    plus classification report and confusion matrix.
-    """
+    """Evaluate model with correct device handling for Quantization."""
     device = device or DEVICE
     
-    # BitsAndBytes 8-bit models cannot be moved manually as they are already device-mapped
-    if not getattr(model, "is_loaded_in_8bit", False):
+    # 1. Smart Device Placement
+    # If model is 8-bit/4-bit, it is already mapped. Do not move.
+    is_quantized = getattr(model, "is_loaded_in_8bit", False) or getattr(model, "is_loaded_in_4bit", False)
+    if not is_quantized:
         model.to(device)
-        
+        target_device = device
+    else:
+        # For quantized models, inputs must be on the same device as the model's execution
+        target_device = model.device
+
     model.eval()
     
     all_preds, all_labels = [], []
@@ -652,8 +602,9 @@ def evaluate_compressed_model(model, val_loader, name, device=None, output_dir=N
     
     with torch.no_grad():
         for batch in tqdm(val_loader, desc=f"Eval {name}", leave=False):
-            input_ids = batch['input_ids'].to(device)
-            attention_mask = batch['attention_mask'].to(device)
+            # Move inputs to the correct device
+            input_ids = batch['input_ids'].to(target_device)
+            attention_mask = batch['attention_mask'].to(target_device)
             labels = batch['labels']
             
             start = time.time()
@@ -670,26 +621,9 @@ def evaluate_compressed_model(model, val_loader, name, device=None, output_dir=N
     size_mb = get_model_size_mb(model)
     avg_time_ms = (total_time / len(all_preds)) * 1000
     
-    # Detailed Analysis (Imbalance Handling)
-    cr = classification_report(all_labels, all_preds, output_dict=True, zero_division=0)
-    cm = confusion_matrix(all_labels, all_preds)
-    
-    # Save Confusion Matrix if output_dir is provided
+    # Visualizations
     if output_dir:
-        plt.figure(figsize=(10, 8))
-        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
-                    xticklabels=list(EMOTION_LABELS.values()),
-                    yticklabels=list(EMOTION_LABELS.values()))
-        plt.xlabel('Predicted')
-        plt.ylabel('True')
-        plt.title(f'{name} - Confusion Matrix')
-        
-        # Clean name for filename (remove parentheses, spaces)
-        safe_name = re.sub(r'[^\w\-_]', '_', name)
-        cm_path = os.path.join(output_dir, 'visualizations', f'{safe_name}_confusion_matrix.png')
-        plt.savefig(cm_path, dpi=150, bbox_inches='tight')
-        plt.close()
-        print(f"    Saved confusion matrix: {cm_path}")
+        VisualizationUtils.plot_confusion_matrix(all_labels, all_preds, name, output_dir)
     
     return {
         'name': name,
@@ -697,65 +631,61 @@ def evaluate_compressed_model(model, val_loader, name, device=None, output_dir=N
         'macro_f1': macro_f1,
         'size_mb': size_mb,
         'inference_time_ms': avg_time_ms,
-        'num_samples': len(all_preds),
-        'per_class_report': cr,
-        'confusion_matrix': cm.tolist()
+        'per_class_report': classification_report(all_labels, all_preds, output_dict=True, zero_division=0)
     }
 
 
-def load_compressed_model(model_dir: str, prune_amount: float = 0.0):
-    """
-    Load model with INT8 Quantization using BitsAndBytes, optionally with Pruning.
-    
-    Args:
-        model_dir: Path to HF model directory
-        prune_amount: Fraction of weights to prune before quantization (0.0 to disable)
-    """
-    if prune_amount > 0:
-        print(f"\n  Creating Compressed Model (Pruning {prune_amount:.0%} + INT8)...")
-    else:
-        print("\n  Creating Compressed Model (INT8 Only)...")
+def load_compressed_model(model_dir: str, prune_amount: float = 0.0, quant_type: str = 'int8', device=None):
+    """Load model with Quantization (INT8 or NF4), optionally with Pruning."""
+    label = f"{'Pruned ' if prune_amount > 0 else ''}{quant_type.upper()}"
+    print(f"\n  Creating Compressed Model ({label})...")
         
     from transformers import BitsAndBytesConfig
     
-    # 1. Load fine-tuned model (FP32)
-    print("   1. Loading fine-tuned weights...")
+    # 1. Load fine-tuned weights (FP32) 
     model = AutoModelForSequenceClassification.from_pretrained(
         model_dir, num_labels=6, ignore_mismatched_sizes=True
     )
     
-    # 2. Apply Pruning (Optional)
+    # 2. Pruning
     if prune_amount > 0:
-        print(f"   2. Applying {prune_amount:.0%} Unstructured Pruning...")
-        pruned_count = 0
-        for name, module in model.named_modules():
-            if isinstance(module, nn.Linear):
-                prune.l1_unstructured(module, name='weight', amount=prune_amount)
-                prune.remove(module, 'weight')  # Make permanent
-                pruned_count += 1
-        print(f"      Pruned {pruned_count} layers.")
+        model = apply_pruning(model, prune_amount)
     
-    # Save temp model (standard format for BitsAndBytes reloading)
+    # Save temp model for reloading, necessary for BitsAndBytesConfig since it required loading from a directory
     temp_dir = "./temp_compressed_model"
     model.save_pretrained(temp_dir)
     del model
     gc.collect()
     
-    # 3. Reload with INT8 Quantization
-    print(f"   {3 if prune_amount > 0 else 2}. Reloading with BitsAndBytes INT8 (skip_modules=['classifier'])...")
-    quant_config = BitsAndBytesConfig(
-        load_in_8bit=True,
-        llm_int8_threshold=6.0,          # Handle outliers in FP16
-        llm_int8_skip_modules=["classifier"]  # PROTECT THE HEAD
-    )
+    # 3. Quantization Config
+    if quant_type == 'nf4':
+        quant_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_use_double_quant=True
+        )
+    else:  # int8 skipping classification head to avoid collapse of the softmax layer
+        quant_config = BitsAndBytesConfig(
+            load_in_8bit=True,
+            llm_int8_threshold=6.0,
+            llm_int8_skip_modules=["classifier"]
+        )
     
+    # Determine device map to force single-GPU execution
+    if device and device.type == 'cuda':
+        d_map = {"": device.index if device.index is not None else 0}
+    else:
+        d_map = "auto"
+
+    # Reload
     compressed_model = AutoModelForSequenceClassification.from_pretrained(
         temp_dir,
         quantization_config=quant_config,
-        device_map="auto"
+        device_map=d_map
     )
     
-    # Clean up
+    # Cleanup temporary files 
     import shutil
     if os.path.exists(temp_dir):
         shutil.rmtree(temp_dir)
@@ -766,502 +696,222 @@ def load_compressed_model(model_dir: str, prune_amount: float = 0.0):
 def compress_and_evaluate(weights_path: str, val_csv: str, model_id: str = None,
                           output_dir: str = './compression_results',
                           technique: str = 'all') -> dict:
-    """
-    Apply compression techniques and compare performance.
-    
-    Args:
-        weights_path: Path to trained model checkpoint (.pt)
-        val_csv: Path to validation dataset CSV
-        model_id: HuggingFace model ID (optional if in checkpoint)
-        output_dir: Directory to save reports and charts
-        technique: Compression mode ('prune', 'quantize', 'combined', or 'all')
-    
-    Returns:
-        Dictionary containing metrics for all evaluated models.
-    """
-    print(f"\n{'='*70}")
-    print(f"MODEL COMPRESSION ANALYSIS ({technique.upper()})")
-    print(f"{'='*70}")
+    """Run compression benchmarks."""
+    set_global_seed(SEED)
+    print(f"\n{'='*40}\nCOMPRESSION ANALYSIS ({technique})\n{'='*40}")
     
     os.makedirs(output_dir, exist_ok=True)
     vis_dir = os.path.join(output_dir, 'visualizations')
     os.makedirs(vis_dir, exist_ok=True)
+
+    # 1. Load Metadata
+    meta = load_checkpoint_metadata(weights_path, 'cpu')
+    resolved_model_id = meta['model_id'] or model_id
+    if not resolved_model_id:
+        raise ValueError("Model ID required.")
     
-    # Load checkpoint
-    checkpoint = torch.load(weights_path, map_location='cpu')
-    
-    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-        state_dict = checkpoint['model_state_dict']
-        model_id = model_id or checkpoint.get('model_id')
-        max_length = checkpoint.get('config', {}).get('max_length', MAX_LENGTH)
-    else:
-        state_dict = checkpoint
-        max_length = MAX_LENGTH
-    
-    if model_id is None:
-        raise ValueError("model_id required")
-    
-    # Derive HuggingFace save directory from weights path
-    # e.g., outputs/best_BERTweet.pt -> outputs/best_BERTweet
-    hf_model_dir = weights_path.replace('.pt', '')
-    
-    print(f"  Model: {model_id}")
-    print(f"  Weights: {weights_path}")
-    print(f"  HF Dir: {hf_model_dir}")
-    
-    # Prepare validation data
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    # Ensure HF format exists
+    hf_dir = weights_path.replace('.pt', '')
+    if not os.path.isdir(hf_dir):
+        print(f" Converting to HF format at {hf_dir}...")
+        temp = AutoModelForSequenceClassification.from_pretrained(resolved_model_id, num_labels=6, ignore_mismatched_sizes=True)
+        temp.load_state_dict(meta['state_dict'])
+        temp.save_pretrained(hf_dir)
+        AutoTokenizer.from_pretrained(resolved_model_id).save_pretrained(hf_dir)
+        del temp
+
+    # 2. Data
+    tokenizer = AutoTokenizer.from_pretrained(resolved_model_id)
     val_df = pd.read_csv(val_csv)
     val_df['text'] = val_df['text'].apply(DataCleaner.clean_text)
-    val_ds = EmotionDataset(val_df['text'], val_df['label'], tokenizer, max_length)
-    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
-    
-    def load_fresh_model():
-        model = AutoModelForSequenceClassification.from_pretrained(
-            model_id, num_labels=6, ignore_mismatched_sizes=True
-        )
-        model.load_state_dict(state_dict)
-        return model
+    val_ds = EmotionDataset(val_df['text'], val_df['label'], tokenizer, MAX_LENGTH)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
     
     results = {}
-    
-    # 1. Original Model (Baseline)
-    # Always run baseline to ensure self-contained report
-    print("\n  Evaluating Original Model (GPU)...")
-    original = load_fresh_model().to(DEVICE)
-    results['original'] = evaluate_compressed_model(original, val_loader, 'Original (GPU)', output_dir=output_dir)
-    del original
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    gc.collect()
-    
-    # 2. Pruned Model
-    if technique in ['prune', 'all']:
-        print("\n  Applying 30% Pruning...")
-        pruned = load_fresh_model()
-        pruned = apply_pruning(pruned, amount=0.3)
-        pruned.to(DEVICE)
-        results['pruned_30'] = evaluate_compressed_model(pruned, val_loader, 'Pruned 30%', output_dir=output_dir)
-        del pruned
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        gc.collect()
-    
-    # 3. Quantized Model
-    if technique in ['quantize', 'all']:
-        # Ensure HF directory exists for BitsAndBytes loading
-        if not os.path.isdir(hf_model_dir):
-            print(f"  HF directory not found. Converting {weights_path} to HF format at {hf_model_dir}...")
-            try:
-                tokenizer = AutoTokenizer.from_pretrained(model_id)
-                model = load_fresh_model()
-                model.save_pretrained(hf_model_dir)
-                tokenizer.save_pretrained(hf_model_dir)
-                del model
-                print("  Conversion complete.")
-            except Exception as e:
-                print(f"  Error converting to HF format: {e}")
 
-        if os.path.isdir(hf_model_dir):
-            quantized = load_compressed_model(hf_model_dir, prune_amount=0.0)
-            results['quantized_int8'] = evaluate_compressed_model(quantized, val_loader, 'Quantized INT8', output_dir=output_dir)
-            del quantized
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        else:
-            print("  Skipping quantization (model directory missing).")
-            
-    # 4. Combined Model (Pruned + INT8)
-    if technique in ['combined', 'all']:
-        if os.path.isdir(hf_model_dir):
-            combined = load_compressed_model(hf_model_dir, prune_amount=0.3)
-            results['combined'] = evaluate_compressed_model(combined, val_loader, 'Pruned + INT8', output_dir=output_dir)
-            del combined
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        else:
-            print("  Skipping combined compression (model directory missing).")
-    
+    # --- Benchmark 1: Original ---
+    print("\n1. Evaluating Original...")
+    orig = AutoModelForSequenceClassification.from_pretrained(resolved_model_id, num_labels=6, ignore_mismatched_sizes=True)
+    orig.load_state_dict(meta['state_dict'])
+    results['original'] = evaluate_compressed_model(orig, val_loader, "Original", device=DEVICE, output_dir=vis_dir)
+    del orig
     gc.collect()
+    if torch.cuda.is_available(): torch.cuda.empty_cache()
+
+    # --- Benchmark 2: Pruned ---
+    if technique in ['prune', 'all', 'combined']:
+        print("\n2. Evaluating Pruned (30%)...")
+        pruned = AutoModelForSequenceClassification.from_pretrained(resolved_model_id, num_labels=6, ignore_mismatched_sizes=True)
+        pruned.load_state_dict(meta['state_dict'])
+        pruned = apply_pruning(pruned, 0.3)
+        results['pruned'] = evaluate_compressed_model(pruned, val_loader, "Pruned 30%", device=DEVICE, output_dir=vis_dir)
+        del pruned
+        gc.collect()
+        if torch.cuda.is_available(): torch.cuda.empty_cache()
+
+    # --- Benchmark 3: Quantized ---
+    if technique in ['quantize', 'all', 'combined']:
+        if os.path.isdir(hf_dir):
+            # INT8
+            print("\n3a. Evaluating Quantized (INT8)...")
+            q8 = load_compressed_model(hf_dir, 0.0, 'int8', device=DEVICE)
+            results['quantized_int8'] = evaluate_compressed_model(q8, val_loader, "Quantized INT8", output_dir=vis_dir)
+            del q8
+            gc.collect()
+            if torch.cuda.is_available(): torch.cuda.empty_cache()
+            
+            # NF4
+            print("\n3b. Evaluating Quantized (NF4)...")
+            q4 = load_compressed_model(hf_dir, 0.0, 'nf4', device=DEVICE)
+            results['quantized_nf4'] = evaluate_compressed_model(q4, val_loader, "Quantized NF4", output_dir=vis_dir)
+            del q4
+            gc.collect()
+            if torch.cuda.is_available(): torch.cuda.empty_cache()
+
+    # --- Benchmark 4: Combined pruning and nf4 ---
+    if technique in ['combined', 'all']:
+        if os.path.isdir(hf_dir):
+            print("\n4. Evaluating Combined (Pruned + NF4)...")
+            comb = load_compressed_model(hf_dir, 0.3, 'nf4', device=DEVICE)
+            results['combined'] = evaluate_compressed_model(comb, val_loader, "Pruned + NF4", output_dir=vis_dir)
+            del comb
+            gc.collect()
+            if torch.cuda.is_available(): torch.cuda.empty_cache()
+
+    # Report
+    print("\n--- Compression Results ---")
+    rows = []
+    for k, v in results.items():
+        rows.append({
+            'Model': v['name'],
+            'Acc': v['accuracy'],
+            'MacroF1': v['macro_f1'],
+            'Size(MB)': v['size_mb'],
+            'Lat(ms)': v['inference_time_ms']
+        })
+    print(pd.DataFrame(rows).to_string(index=False))
     
-    # Print comparison table
-    print(f"\n{'='*70}")
-    print(f"  COMPRESSION COMPARISON ({technique})")
-    print(f"{'='*70}\n")
-    
-    comparison_df = pd.DataFrame({
-        'Model': [r['name'] for r in results.values()],
-        'Accuracy': [f"{r['accuracy']:.4f}" for r in results.values()],
-        'Macro F1': [f"{r['macro_f1']:.4f}" for r in results.values()],
-        'Size (MB)': [f"{r['size_mb']:.2f}" for r in results.values()],
-        'Inference (ms)': [f"{r['inference_time_ms']:.3f}" for r in results.values()],
-    })
-    print(comparison_df.to_string(index=False))
-    
-    # Detailed Imbalance Analysis
-    print(f"\n  Granular Analysis (Imbalance Handling):")
-    for key, res in results.items():
-        print(f"\n  [{res['name']}]")
-        cr = res['per_class_report']
-        # Check "Surprise" (Label 5) specifically
-        surprise = cr.get('5', {})
-        print(f"   Surprise (Class 5): Recall={surprise.get('recall', 0):.4f}, Precision={surprise.get('precision', 0):.4f}, F1={surprise.get('f1-score', 0):.4f}")
-        print(f"   Macro F1: {res['macro_f1']:.4f}")
-    
-    # Calculate improvements
-    orig = results['original']
-    print(f"\n  Compression Analysis:")
-    for key, res in results.items():
-        if key == 'original': continue
+    with open(os.path.join(output_dir, 'compression_report.json'), 'w') as f:
+        json.dump(results, f, indent=2)
         
-        reduction = (res['size_mb'] / orig['size_mb'] - 1) * 100
-        speedup = orig['inference_time_ms'] / res['inference_time_ms'] if res['inference_time_ms'] > 0 else 0
-        f1_diff = res['macro_f1'] - orig['macro_f1']
-        
-        degraded = " DEGRADED" if f1_diff < -0.05 else ""
-        print(f"   {res['name']:20s}: {reduction:+.1f}% size, {speedup:.2f}x speed, {f1_diff:+.4f} Macro F1{degraded}")
-    
-    # Save comparison chart
-    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-    
-    names = [r['name'] for r in results.values()]
-    accuracies = [r['accuracy'] for r in results.values()]
-    macro_f1s = [r['macro_f1'] for r in results.values()]
-    sizes = [r['size_mb'] for r in results.values()]
-    times = [r['inference_time_ms'] for r in results.values()]
-    colors = ['#2ecc71', '#3498db', '#9b59b6']
-    
-    # Row 1: Accuracy and Macro F1
-    axes[0, 0].bar(names, accuracies, color=colors[:len(names)])
-    axes[0, 0].set_ylabel('Accuracy')
-    axes[0, 0].set_title('Accuracy Comparison')
-    axes[0, 0].set_ylim([min(accuracies) - 0.05, 1.0])
-    axes[0, 0].tick_params(axis='x', rotation=15)
-    for i, v in enumerate(accuracies):
-        axes[0, 0].text(i, v + 0.01, f'{v:.3f}', ha='center', fontsize=9)
-    
-    axes[0, 1].bar(names, macro_f1s, color=colors[:len(names)])
-    axes[0, 1].set_ylabel('Macro F1')
-    axes[0, 1].set_title('Macro F1 Comparison')
-    axes[0, 1].set_ylim([min(macro_f1s) - 0.05, 1.0])
-    axes[0, 1].tick_params(axis='x', rotation=15)
-    for i, v in enumerate(macro_f1s):
-        axes[0, 1].text(i, v + 0.01, f'{v:.3f}', ha='center', fontsize=9)
-    
-    # Row 2: Size and Speed
-    axes[1, 0].bar(names, sizes, color=colors[:len(names)])
-    axes[1, 0].set_ylabel('Size (MB)')
-    axes[1, 0].set_title('Model Size Comparison')
-    axes[1, 0].tick_params(axis='x', rotation=15)
-    for i, v in enumerate(sizes):
-        axes[1, 0].text(i, v + 5, f'{v:.1f}', ha='center', fontsize=9)
-    
-    axes[1, 1].bar(names, times, color=colors[:len(names)])
-    axes[1, 1].set_ylabel('Inference Time (ms/sample)')
-    axes[1, 1].set_title('Inference Speed Comparison')
-    axes[1, 1].tick_params(axis='x', rotation=15)
-    for i, v in enumerate(times):
-        axes[1, 1].text(i, v + 0.005, f'{v:.3f}', ha='center', fontsize=9)
-    
-    title_suffix = technique.capitalize() if technique != 'all' else "Pruning + INT8"
-    plt.suptitle(f'Model Compression Results ({title_suffix})', fontsize=14, fontweight='bold')
-    plt.tight_layout()
-    
-    chart_name = f'{technique}_comparison.png' if technique != 'all' else 'compression_comparison.png'
-    chart_path = os.path.join(vis_dir, chart_name)
-    plt.savefig(chart_path, dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"\n  Chart saved: {chart_path}")
-    
-    # Save JSON report
-    report = {
-        'model_id': model_id,
-        'weights_path': weights_path,
-        'technique_filter': technique,
-        'results': {k: {kk: vv for kk, vv in v.items()} for k, v in results.items()},
-    }
-    
-    report_name = f'{technique}_report.json' if technique != 'all' else 'compression_report.json'
-    report_path = os.path.join(output_dir, report_name)
-    with open(report_path, 'w') as f:
-        json.dump(report, f, indent=2)
-    print(f"  Report saved: {report_path}")
-    
     return results
 
 
-# ==================== MAIN TRAINING ====================
+# ==================== MAIN TRAINING LOOP ====================
 def main(train_path='train.csv', val_path='validation.csv', output_dir='./outputs', specific_model=None):
     """
     Main training pipeline.
     
     Args:
-        train_path: Path to training CSV
-        val_path: Path to validation CSV
-        output_dir: Directory for outputs (checkpoints, visualizations, reports)
-        specific_model: Train only this model (None = train all)
+        train_path (str): Path to the training dataset CSV file.
+        val_path (str): Path to the validation dataset CSV file.
+        output_dir (str): Directory to save model checkpoints and visualizations.
+        specific_model (str, optional): Name of a specific model to train (e.g., 'BERTweet').
+                                        If None, trains all defined models.
     """
-    models_to_run = MODELS
-    if specific_model:
-        if specific_model in MODELS:
-            models_to_run = {specific_model: MODELS[specific_model]}
-            print(f"Selected model: {specific_model}")
-        else:
-            raise ValueError(f"Model {specific_model} not found in {list(MODELS.keys())}")
-
-    print(f"Models to train: {list(models_to_run.keys())}")
-
+    set_global_seed(SEED)
     os.makedirs(output_dir, exist_ok=True)
-    os.makedirs(os.path.join(output_dir, 'visualizations'), exist_ok=True)
-
-    print(f"\nOutput directory: {output_dir}")
-
-    train_df, val_df = load_and_prepare_data(train_path, val_path)
-    if train_df is None:
-        raise Exception("Data not loaded")
-
-    class_weights = get_class_weights(train_df['label'].values)
-    print("\nClass distribution:\n", train_df['label'].value_counts().sort_index())
-
-    models_results = {}
+    vis_dir = os.path.join(output_dir, 'visualizations')
+    os.makedirs(vis_dir, exist_ok=True)
     
-    # ==================== TRAINING LOOP ====================
-    for model_name, model_id in models_to_run.items():
-        print("\n" + "="*70)
-        print(f"TRAINING: {model_name}")
-        print("="*70)
+    # 1. Load Data
+    print(f"Loading data from {train_path}...")
+    train_df = pd.read_csv(train_path)
+    val_df = pd.read_csv(val_path)
+    
+    # Visualize Imbalance 
+    VisualizationUtils.plot_class_distribution(train_df['label'], vis_dir)
+    
+    cleaner = DataCleaner()
+    for df in [train_df, val_df]:
+        df = cleaner.handle_missing_values(df)
+        df['text'] = df['text'].apply(cleaner.clean_text)
+        df = cleaner.remove_duplicates(df)
+        df = cleaner.remove_outliers(df)
+        
+    # Class Weights (Active Strategy)
+    counts = Counter(train_df['label'])
+    total = len(train_df)
+    weights = [total / counts[i] for i in range(6)]
+    class_weights = np.array(weights) / sum(weights) * 6
+    print(f"Class Weights: {np.round(class_weights, 3)}")
 
-        try:
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            gc.collect()
+    # 2. Train Models
+    models_to_run = {specific_model: MODELS[specific_model]} if specific_model else MODELS
+    results = {}
 
-            clf = EmotionClassifier(model_name, model_id, DEVICE, class_weights=class_weights)
-
-            train_ds = EmotionDataset(train_df['text'], train_df['label'], clf.tokenizer, MAX_LENGTH)
-            val_ds = EmotionDataset(val_df['text'], val_df['label'], clf.tokenizer, MAX_LENGTH)
-
-            train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
-            val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
-
-            print(f" Training: {len(train_ds)} | Validation: {len(val_ds)}")
-            print(f" Batch size: {BATCH_SIZE} | Steps/epoch: {len(train_loader)}")
-
-            clf.train(train_loader, val_loader, num_epochs=EPOCHS, output_dir=output_dir)
-
-            preds, true_labels, logits, infer_time = clf.predict(val_loader)
-
-            # Compute all metrics
-            acc = accuracy_score(true_labels, preds)
-            weighted_f1 = f1_score(true_labels, preds, average='weighted', zero_division=0)
-            macro_f1 = f1_score(true_labels, preds, average='macro', zero_division=0)
-            macro_precision = precision_score(true_labels, preds, average='macro', zero_division=0)
-            macro_recall = recall_score(true_labels, preds, average='macro', zero_division=0)
-            cm = confusion_matrix(true_labels, preds)
-            cr = classification_report(true_labels, preds, output_dict=True, zero_division=0)
-
-            model_size = get_model_size_mb(clf.model)
-
-            # Save confusion matrix
-            plt.figure(figsize=(10, 8))
-            sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
-                        xticklabels=list(EMOTION_LABELS.values()),
-                        yticklabels=list(EMOTION_LABELS.values()))
-            plt.xlabel('Predicted')
-            plt.ylabel('True')
-            plt.title(f'{model_name} - Confusion Matrix')
-            cm_path = os.path.join(output_dir, 'visualizations', f'{model_name}_confusion_matrix.png')
-            plt.savefig(cm_path, dpi=150, bbox_inches='tight')
-            plt.close()
-
-            # Save training curves
-            clf.save_training_curves(output_dir)
-
-            models_results[model_name] = {
-                'predictions': preds,
-                'true_labels': true_labels,
-                'accuracy': acc,
-                'weighted_f1': weighted_f1,
-                'macro_f1': macro_f1,
-                'macro_precision': macro_precision,
-                'macro_recall': macro_recall,
-                'confusion_matrix': cm.tolist(),
-                'inference_time': infer_time,
-                'model_size': model_size,
-                'history': clf.history,
-                'classification_report': cr
-            }
-
-            # Display results
-            print(f"\n✅ {model_name} Results:")
-            print(f" Accuracy: {acc:.4f} ({acc*100:.2f}%)")
-            print(f" Macro F1: {macro_f1:.4f}")
-            print(f" Macro Precision: {macro_precision:.4f}")
-            print(f" Macro Recall: {macro_recall:.4f}")
-            print(f" Weighted F1: {weighted_f1:.4f}")
-            print(f" Inference: {infer_time*1000:.2f} ms/sample")
-            print(f" Size: {model_size:.2f} MB")
-
-            # Per-class breakdown
-            print("\n Per-class metrics:")
-            for label_id, label_name in EMOTION_LABELS.items():
-                cls = cr.get(str(label_id), {})
-                print(f"   {label_name:10s}: P={cls.get('precision',0):.3f} "
-                      f"R={cls.get('recall',0):.3f} F1={cls.get('f1-score',0):.3f}")
-
-            del clf.model
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            gc.collect()
-
-        except Exception as e:
-            print("❌ Error training", model_name, ":", e)
-            import traceback
-            traceback.print_exc()
-
-    print("\n" + "="*70)
-    print("✅ TRAINING COMPLETE!")
-    print("="*70)
-
-    # ==================== RESULTS SUMMARY ====================
-    if models_results:
-        print("\n📊 FINAL RESULTS\n")
-        df = pd.DataFrame({
-            'Model': list(models_results.keys()),
-            'Accuracy': [models_results[m]['accuracy'] for m in models_results],
-            'Macro F1': [models_results[m]['macro_f1'] for m in models_results],
-            'Weighted F1': [models_results[m]['weighted_f1'] for m in models_results],
-            'Inference (ms)': [models_results[m]['inference_time']*1000 for m in models_results],
-            'Size (MB)': [models_results[m]['model_size'] for m in models_results],
-        })
-        print(df.to_string(index=False))
-
-        # Best model by Macro F1 (appropriate for imbalanced data)
-        best = max(models_results.keys(), key=lambda x: models_results[x]['macro_f1'])
-        print(f"\n🏆 Best model (by Macro F1): {best}")
-        print(f" Macro F1: {models_results[best]['macro_f1']:.4f}")
-        print(f" Accuracy: {models_results[best]['accuracy']:.4f}")
-
-        # Save comprehensive report
-        report = {
-            'best_model': best,
-            'selection_metric': 'macro_f1',
-            'models_comparison': {
-                m: {
-                    'accuracy': r['accuracy'],
-                    'macro_f1': r['macro_f1'],
-                    'macro_precision': r['macro_precision'],
-                    'macro_recall': r['macro_recall'],
-                    'weighted_f1': r['weighted_f1'],
-                    'inference_time_ms': r['inference_time']*1000,
-                    'model_size_mb': r['model_size'],
-                    'confusion_matrix': r['confusion_matrix'],
-                    'per_class_report': r['classification_report'],
-                }
-                for m, r in models_results.items()
-            }
+    for name, mid in models_to_run.items():
+        print(f"\n--- Training {name} ---")
+        
+        clf = EmotionClassifier(name, mid, DEVICE, class_weights)
+        train_ds = EmotionDataset(train_df['text'], train_df['label'], clf.tokenizer, MAX_LENGTH)
+        val_ds = EmotionDataset(val_df['text'], val_df['label'], clf.tokenizer, MAX_LENGTH)
+        
+        train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
+        val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
+        
+        clf.train(train_loader, val_loader, EPOCHS, output_dir)
+        VisualizationUtils.plot_training_curves(clf.history, name, vis_dir)
+        
+        # Final Evaluation
+        preds, true_labels, logits, infer_time = clf.predict(val_loader)
+        
+        # Metrics
+        macro_f1 = f1_score(true_labels, preds, average='macro')
+        acc = accuracy_score(true_labels, preds)
+        
+        results[name] = {
+            'accuracy': acc,
+            'macro_f1': macro_f1,
+            'inference_time': infer_time,
+            'model_size': get_model_size_mb(clf.model)
         }
-        report_path = os.path.join(output_dir, 'emotion_classification_report.json')
-        with open(report_path, 'w') as f:
-            json.dump(report, f, indent=2)
-        print(f"\n📄 Report saved: {report_path}")
-    else:
-        print("No results - check errors above.")
+        
+        # Visualizations
+        VisualizationUtils.plot_confusion_matrix(true_labels, preds, name, vis_dir)
+        VisualizationUtils.plot_pr_curves(true_labels, logits, name, vis_dir)
+        
+        print(f"Result {name}: Acc={acc:.4f}, MacroF1={macro_f1:.4f}")
+        
+        del clf
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    # 3. Save Final Report
+    best_model = max(results, key=lambda x: results[x]['macro_f1'])
+    print(f"\n🏆 Best Model (Macro F1): {best_model}")
+    
+    with open(os.path.join(output_dir, 'emotion_classification_report.json'), 'w') as f:
+        json.dump({'results': results, 'best_model': best_model}, f, indent=2)
 
 
-# ==================== CLI INTERFACE ====================
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description='Emotion Classification with BERT-based Models',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  Training all models:
-    python emotion_classifier.py --train train.csv --val validation.csv
-
-  Training specific model on GPU 1:
-    python emotion_classifier.py --model BERTweet --output ./outputs --gpu 1
-
-  Inference on test set:
-    python emotion_classifier.py --mode inference --weights best_ModernBERT.pt --test_csv test.csv
-
-  Compression analysis:
-    python emotion_classifier.py --mode compress --weights best_ModernBERT.pt --val validation.csv
-        """
-    )
-    
-    # Mode selection
-    parser.add_argument('--mode', type=str, default='train',
-                        choices=['train', 'inference', 'compress'],
-                        help='Operation mode (default: train)')
-    
-    # Training arguments
-    parser.add_argument('--train', type=str, default='train.csv',
-                        help='Training CSV path')
-    parser.add_argument('--val', type=str, default='validation.csv',
-                        help='Validation CSV path')
-    parser.add_argument('--output', type=str, default='./outputs',
-                        help='Output directory')
-    parser.add_argument('--model', type=str, default=None,
-                        choices=list(MODELS.keys()),
-                        help='Specific model to train')
-    
-    # Inference arguments
-    parser.add_argument('--weights', type=str,
-                        help='Path to .pt weights file')
-    parser.add_argument('--test_csv', type=str,
-                        help='Path to test CSV for inference')
-    parser.add_argument('--model_id', type=str,
-                        help='HuggingFace model ID (if not in checkpoint)')
-    
-    # Compression arguments
-    parser.add_argument('--technique', type=str, default='all',
-                        choices=['prune', 'quantize', 'combined', 'all'],
-                        help='Compression technique to apply (prune, quantize, combined, or all)')
-    
-    # Device selection
-    parser.add_argument('--gpu', type=int, default=None,
-                        help='GPU device ID (e.g., 0 or 1). Default: auto-detect')
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Emotion Classifier CLI")
+    parser.add_argument('--mode', choices=['train', 'inference', 'compress'], default='train', 
+                        help="Operation mode: 'train' (default), 'inference' (predict), or 'compress' (benchmark).")
+    parser.add_argument('--train', default='train.csv', 
+                        help="Path to training CSV file (default: train.csv).")
+    parser.add_argument('--val', default='validation.csv', 
+                        help="Path to validation CSV file (default: validation.csv).")
+    parser.add_argument('--test_csv', help="Path to test CSV file. Required for inference mode.")
+    parser.add_argument('--weights', help="Path to trained model checkpoint (.pt). Required for inference/compress.")
+    parser.add_argument('--output', default='./outputs', 
+                        help="Directory to save outputs (checkpoints, reports, plots).")
+    parser.add_argument('--model', choices=MODELS.keys(), 
+                        help="Specific model architecture to use (optional). If omitted, trains all models.")
+    parser.add_argument('--technique', default='all', choices=['prune', 'quantize', 'combined', 'all'],
+                        help="Compression technique to benchmark: 'prune', 'quantize', 'combined', or 'all'.")
+    parser.add_argument('--model_id', help="Hugging Face Model ID (e.g. 'vinai/bertweet-base'). Overrides metadata in checkpoint.")
     
     args = parser.parse_args()
     
-    # Set device before anything else
-    if args.gpu is not None:
-        set_device(args.gpu)
-    
-    _print_config(args.gpu)
-    
     if args.mode == 'train':
-        print(f"\n📌 Mode: Training")
-        print(f" Train: {args.train} | Val: {args.val} | Output: {args.output}")
-        if args.model:
-            print(f" Model: {args.model}")
-        main(
-            train_path=args.train,
-            val_path=args.val,
-            output_dir=args.output,
-            specific_model=args.model
-        )
-    
+        main(args.train, args.val, args.output, args.model)
     elif args.mode == 'inference':
-        print(f"\n📌 Mode: Inference")
         if not args.weights or not args.test_csv:
-            raise ValueError("--weights and --test_csv required for inference mode")
-        predictions = run_inference(
-            weights=args.weights,
-            csv=args.test_csv,
-            model_id=args.model_id
-        )
-        print(f"\n✅ Generated {len(predictions)} predictions")
-    
+            raise ValueError("Inference requires --weights and --test_csv")
+        run_inference(args.weights, args.test_csv, args.model_id)
     elif args.mode == 'compress':
-        print(f"\n📌 Mode: Compression Analysis")
-        if not args.weights:
-            raise ValueError("--weights required for compress mode")
-        compress_and_evaluate(
-            weights_path=args.weights,
-            val_csv=args.val,
-            model_id=args.model_id,
-            output_dir=args.output,
-            technique=args.technique
-        )
+        if not args.weights or not args.val:
+            raise ValueError("Compression requires --weights and --val")
+        compress_and_evaluate(args.weights, args.val, args.model_id, args.output, args.technique)
