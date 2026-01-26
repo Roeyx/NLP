@@ -1,6 +1,7 @@
 # Emotion Classification with BERT-based Models
 
 This repository contains the implementation for the paper "Emotion Classification with BERT-based Models". It provides a pipeline for fine-tuning Transformer models (BERTweet, CardiffRoBERTa, ModernBERT) on 6-class emotion recognition, along with compression techniques (Pruning + Quantization).
+pt files can be used and download via google drive link in emotion_classifier.ipynb
 
 ## 🚀 Quick Start (For Graders/Inference)
 
