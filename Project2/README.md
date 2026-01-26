@@ -100,11 +100,11 @@ python emotion_classifier.py --mode compress --weights outputs/best_ModernBERT.p
 ├── requirements.txt         # Dependencies
 ├── train.csv                # (Required for training)
 ├── validation.csv           # (Required for training/eval)
+-- After running the workflow -- 
 ├── outputs/                 # Generated checkpoints and logs
 │   ├── best_ModernBERT.pt
 │   ├── emotion_classification_report.json
 │   └── visualizations/      # Confusion matrices, Loss curves, PR curves
-└── AGENTS.md                # Agent guidelines
 ```
 
 ## Troubleshooting
