@@ -14,6 +14,9 @@ Usage:
     Inference on test set:
         python emotion_classifier.py --mode inference --weights outputs/best_CardiffRoBERTa.pt --test_csv test.csv
 
+    Evaluation on labeled data (Accuracy/F1):
+        python emotion_classifier.py --mode evaluate --weights outputs/best_CardiffRoBERTa.pt --val validation.csv
+
     Compression analysis:
         python emotion_classifier.py --mode compress --weights outputs/best_CardiffRoBERTa.pt --val validation.csv
 
@@ -84,6 +87,11 @@ MODELS = {
     'ModernBERT': 'answerdotai/ModernBERT-base'
 }
 
+# Defaults
+DEFAULT_TRAIN_PATH = 'train.csv'
+DEFAULT_VAL_PATH = 'validation.csv'
+DEFAULT_OUTPUT_DIR = './outputs'
+
 # Hyperparameters
 BATCH_SIZE = 32
 EPOCHS = 5
@@ -127,7 +135,8 @@ def load_checkpoint_metadata(weights_path, device=None):
     metadata['state_dict'] = checkpoint['model_state_dict']
     metadata['model_id'] = checkpoint.get('model_id')
     metadata['config'] = checkpoint.get('config', {})
-    print(f"  Format: Metadata-Rich (Model ID: {metadata['model_id']})")
+    metadata['compression_type'] = checkpoint.get('compression_type') # Capture compression info
+    print(f"  Format: Metadata-Rich (Model ID: {metadata['model_id']}, Compression: {metadata['compression_type']})")
 
     return metadata
 
@@ -472,35 +481,6 @@ class EmotionClassifier:
         meta = load_checkpoint_metadata(ckpt_path, self.device)
         self.model.load_state_dict(meta['state_dict'])
 
-    def predict(self, test_loader):
-        """Run full prediction for evaluation."""
-        self.model.eval()
-        all_preds, all_labels, all_logits = [], [], []
-        times = []
-        
-        with torch.no_grad():
-            for batch in tqdm(test_loader, desc="Predicting"):
-                input_ids = batch['input_ids'].to(self.device)
-                attention_mask = batch['attention_mask'].to(self.device)
-                labels = batch.get('labels')
-                if labels is not None:
-                    labels = labels.to(self.device)
-
-                start = time.time()
-                outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
-                times.append((time.time() - start) / len(input_ids))
-
-                logits = outputs.logits
-                preds = torch.argmax(logits, dim=1)
-                
-                all_preds.extend(preds.cpu().numpy())
-                all_logits.extend(logits.cpu().numpy())
-                if labels is not None:
-                    all_labels.extend(labels.cpu().numpy())
-        
-        avg_time = np.mean(times) if times else 0
-        return all_preds, all_labels, all_logits, avg_time
-
 
 # ==================== INFERENCE ====================
 def run_inference(weights: str, csv: str, model_id: str = None, 
@@ -568,6 +548,107 @@ def run_inference(weights: str, csv: str, model_id: str = None,
     return preds
 
 
+# ==================== EVALUATION ====================
+def run_evaluation(weights_path: str, val_csv: str, model_id: str = None, output_dir: str = './outputs'):
+    """
+    Evaluate a trained model on a labeled dataset.
+    Calculates Accuracy, F1, and generates Confusion Matrix.
+    """
+    set_global_seed(SEED)
+    print(f"\n{'='*40}\nRUNNING EVALUATION\n{'='*40}")
+    
+    os.makedirs(output_dir, exist_ok=True)
+    vis_dir = os.path.join(output_dir, 'visualizations')
+    os.makedirs(vis_dir, exist_ok=True)
+
+    # 1. Load Metadata
+    meta = load_checkpoint_metadata(weights_path, 'cpu')
+    resolved_model_id = meta['model_id'] or model_id
+    if not resolved_model_id:
+        raise ValueError("Model ID not found in checkpoint. Provide --model_id.")
+    
+    print(f" Model ID: {resolved_model_id}")
+    
+    # 2. Load Model & Tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(resolved_model_id)
+    
+    # Check for compression metadata
+    compression = meta.get('compression_type', 'none')
+    print(f" Detected Compression: {compression}")
+
+    if compression in ['quantized_int8', 'quantized_nf4', 'combined']:
+        # Map compression string to parameters
+        quant_type = 'int8' if 'int8' in compression else 'nf4'
+        prune_amt = 0.3 if 'combined' in compression else 0.0
+        
+        # Load architecture with quantization config
+        # We assume the base model ID is sufficient to reconstruct the architecture
+        model = load_compressed_model(resolved_model_id, prune_amt, quant_type, DEVICE)
+        
+        # Determine strictness: Quantized state dicts often have missing keys 
+        # (e.g. .absmax, .quant_map) that are buffers, so strict=False might be needed.
+        # However, for this project, we want to ensure we are evaluating the *saved* weights.
+        try:
+            model.load_state_dict(meta['state_dict'], strict=False)
+            print(" Loaded quantized state_dict (strict=False)")
+        except Exception as e:
+            print(f" Warning: Could not load state_dict directly: {e}")
+            print(" Using re-quantized base model (deterministic fallback).")
+            
+    elif compression == 'pruned_30':
+        model = AutoModelForSequenceClassification.from_pretrained(resolved_model_id, num_labels=6)
+        model = apply_pruning(model, 0.3)
+        model.load_state_dict(meta['state_dict'])
+        model.to(DEVICE)
+        
+    else:
+        # Standard FP32 loading
+        model = AutoModelForSequenceClassification.from_pretrained(
+            resolved_model_id, num_labels=6, ignore_mismatched_sizes=True
+        )
+        model.load_state_dict(meta['state_dict'])
+        model.to(DEVICE)
+
+    model.eval()
+
+    # 3. Load Data
+    print(f" Loading data from {val_csv}...")
+    try:
+        df = pd.read_csv(val_csv)
+    except FileNotFoundError:
+        print(f"Error: File {val_csv} not found.")
+        return
+
+    # Clean
+    df['text'] = df['text'].apply(DataCleaner.clean_text)
+    
+    # Dataset (Expects 'label' column)
+    if 'label' not in df.columns:
+        raise ValueError(f"CSV {val_csv} must contain a 'label' column for evaluation.")
+
+    dataset = EmotionDataset(df['text'], df['label'], tokenizer, meta['config'].get('max_length', 128))
+    loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False)
+
+    # 4. Evaluate
+    results = evaluate_model_performance(model, loader, "Eval_Model", device=DEVICE, output_dir=vis_dir)
+
+    # 5. Print Report
+    print("\n" + "="*40)
+    print("EVALUATION RESULTS")
+    print("="*40)
+    print(f" Accuracy:  {results['accuracy']:.4f}")
+    print(f" Macro F1:  {results['macro_f1']:.4f}")
+    print(f" Latency:   {results['inference_time_ms']:.2f} ms/sample")
+    print("-" * 20)
+    print("Per-Class Report:")
+    report_df = pd.DataFrame(results['per_class_report']).transpose()
+    print(report_df.to_string())
+    print("-" * 20)
+    print(f"Plots saved to: {vis_dir}")
+
+    return results
+
+
 # ==================== COMPRESSION ====================
 def apply_pruning(model, amount=0.3):
     """Apply unstructured L1 pruning to Linear layers."""
@@ -581,8 +662,11 @@ def apply_pruning(model, amount=0.3):
     return model
 
 
-def evaluate_compressed_model(model, val_loader, name, device=None, output_dir=None):
-    """Evaluate model with correct device handling for Quantization."""
+def evaluate_model_performance(model, val_loader, name, device=None, output_dir=None):
+    """
+    Unified evaluation function for Training, Compression, and Evaluation modes.
+    Handles device placement (standard/quantized), metrics, and visualizations.
+    """
     device = device or DEVICE
     
     # 1. Smart Device Placement
@@ -597,7 +681,7 @@ def evaluate_compressed_model(model, val_loader, name, device=None, output_dir=N
 
     model.eval()
     
-    all_preds, all_labels = [], []
+    all_preds, all_labels, all_logits = [], [], []
     total_time = 0
     
     with torch.no_grad():
@@ -611,9 +695,12 @@ def evaluate_compressed_model(model, val_loader, name, device=None, output_dir=N
             outputs = model(input_ids=input_ids, attention_mask=attention_mask)
             total_time += time.time() - start
             
-            preds = torch.argmax(outputs.logits, dim=1)
+            logits = outputs.logits
+            preds = torch.argmax(logits, dim=1)
+            
             all_preds.extend(preds.cpu().numpy())
             all_labels.extend(labels.numpy())
+            all_logits.extend(logits.cpu().numpy())
     
     # Metrics
     acc = accuracy_score(all_labels, all_preds)
@@ -624,6 +711,7 @@ def evaluate_compressed_model(model, val_loader, name, device=None, output_dir=N
     # Visualizations
     if output_dir:
         VisualizationUtils.plot_confusion_matrix(all_labels, all_preds, name, output_dir)
+        VisualizationUtils.plot_pr_curves(all_labels, all_logits, name, output_dir)
     
     return {
         'name': name,
@@ -729,11 +817,26 @@ def compress_and_evaluate(weights_path: str, val_csv: str, model_id: str = None,
     
     results = {}
 
+    def save_variant(model, suffix):
+        """Helper to save compressed model variants."""
+        base_name = os.path.splitext(os.path.basename(weights_path))[0]
+        fname = f"{base_name}_{suffix}.pt"
+        save_path = os.path.join(output_dir, fname)
+        
+        torch.save({
+            'model_state_dict': model.state_dict(),
+            'model_id': resolved_model_id,
+            'config': meta.get('config', {}),
+            'compression_type': suffix
+        }, save_path)
+        print(f"  💾 Saved {suffix} model to: {save_path}")
+        return save_path
+
     # --- Benchmark 1: Original ---
     print("\n1. Evaluating Original...")
     orig = AutoModelForSequenceClassification.from_pretrained(resolved_model_id, num_labels=6, ignore_mismatched_sizes=True)
     orig.load_state_dict(meta['state_dict'])
-    results['original'] = evaluate_compressed_model(orig, val_loader, "Original", device=DEVICE, output_dir=vis_dir)
+    results['original'] = evaluate_model_performance(orig, val_loader, "Original", device=DEVICE, output_dir=vis_dir)
     del orig
     gc.collect()
     if torch.cuda.is_available(): torch.cuda.empty_cache()
@@ -744,7 +847,11 @@ def compress_and_evaluate(weights_path: str, val_csv: str, model_id: str = None,
         pruned = AutoModelForSequenceClassification.from_pretrained(resolved_model_id, num_labels=6, ignore_mismatched_sizes=True)
         pruned.load_state_dict(meta['state_dict'])
         pruned = apply_pruning(pruned, 0.3)
-        results['pruned'] = evaluate_compressed_model(pruned, val_loader, "Pruned 30%", device=DEVICE, output_dir=vis_dir)
+        # Save first
+        save_path = save_variant(pruned, "pruned_30")
+        # Reload to ensure consistency
+        pruned.load_state_dict(torch.load(save_path)['model_state_dict'])
+        results['pruned'] = evaluate_model_performance(pruned, val_loader, "Pruned 30%", device=DEVICE, output_dir=vis_dir)
         del pruned
         gc.collect()
         if torch.cuda.is_available(): torch.cuda.empty_cache()
@@ -755,7 +862,11 @@ def compress_and_evaluate(weights_path: str, val_csv: str, model_id: str = None,
             # INT8
             print("\n3a. Evaluating Quantized (INT8)...")
             q8 = load_compressed_model(hf_dir, 0.0, 'int8', device=DEVICE)
-            results['quantized_int8'] = evaluate_compressed_model(q8, val_loader, "Quantized INT8", output_dir=vis_dir)
+            # Save first
+            save_path = save_variant(q8, "quantized_int8")
+            # Reload to ensure consistency (simulating user evaluation)
+            q8.load_state_dict(torch.load(save_path)['model_state_dict'], strict=False)
+            results['quantized_int8'] = evaluate_model_performance(q8, val_loader, "Quantized INT8", output_dir=vis_dir)
             del q8
             gc.collect()
             if torch.cuda.is_available(): torch.cuda.empty_cache()
@@ -763,7 +874,11 @@ def compress_and_evaluate(weights_path: str, val_csv: str, model_id: str = None,
             # NF4
             print("\n3b. Evaluating Quantized (NF4)...")
             q4 = load_compressed_model(hf_dir, 0.0, 'nf4', device=DEVICE)
-            results['quantized_nf4'] = evaluate_compressed_model(q4, val_loader, "Quantized NF4", output_dir=vis_dir)
+            # Save first
+            save_path = save_variant(q4, "quantized_nf4")
+            # Reload to ensure consistency (simulating user evaluation)
+            q4.load_state_dict(torch.load(save_path)['model_state_dict'], strict=False)
+            results['quantized_nf4'] = evaluate_model_performance(q4, val_loader, "Quantized NF4", output_dir=vis_dir)
             del q4
             gc.collect()
             if torch.cuda.is_available(): torch.cuda.empty_cache()
@@ -773,7 +888,11 @@ def compress_and_evaluate(weights_path: str, val_csv: str, model_id: str = None,
         if os.path.isdir(hf_dir):
             print("\n4. Evaluating Combined (Pruned + NF4)...")
             comb = load_compressed_model(hf_dir, 0.3, 'nf4', device=DEVICE)
-            results['combined'] = evaluate_compressed_model(comb, val_loader, "Pruned + NF4", output_dir=vis_dir)
+            # Save first
+            save_path = save_variant(comb, "combined")
+            # Reload to ensure consistency (simulating user evaluation)
+            comb.load_state_dict(torch.load(save_path)['model_state_dict'], strict=False)
+            results['combined'] = evaluate_model_performance(comb, val_loader, "Pruned + NF4", output_dir=vis_dir)
             del comb
             gc.collect()
             if torch.cuda.is_available(): torch.cuda.empty_cache()
@@ -798,7 +917,7 @@ def compress_and_evaluate(weights_path: str, val_csv: str, model_id: str = None,
 
 
 # ==================== MAIN TRAINING LOOP ====================
-def main(train_path='train.csv', val_path='validation.csv', output_dir='./outputs', specific_model=None):
+def main(train_path=DEFAULT_TRAIN_PATH, val_path=DEFAULT_VAL_PATH, output_dir=DEFAULT_OUTPUT_DIR, specific_model=None):
     """
     Main training pipeline.
     
@@ -854,24 +973,16 @@ def main(train_path='train.csv', val_path='validation.csv', output_dir='./output
         VisualizationUtils.plot_training_curves(clf.history, name, vis_dir)
         
         # Final Evaluation
-        preds, true_labels, logits, infer_time = clf.predict(val_loader)
-        
-        # Metrics
-        macro_f1 = f1_score(true_labels, preds, average='macro')
-        acc = accuracy_score(true_labels, preds)
+        eval_results = evaluate_model_performance(clf.model, val_loader, name, device=DEVICE, output_dir=vis_dir)
         
         results[name] = {
-            'accuracy': acc,
-            'macro_f1': macro_f1,
-            'inference_time': infer_time,
-            'model_size': get_model_size_mb(clf.model)
+            'accuracy': eval_results['accuracy'],
+            'macro_f1': eval_results['macro_f1'],
+            'inference_time': eval_results['inference_time_ms'] / 1000.0, # convert ms back to s
+            'model_size': eval_results['size_mb']
         }
         
-        # Visualizations
-        VisualizationUtils.plot_confusion_matrix(true_labels, preds, name, vis_dir)
-        VisualizationUtils.plot_pr_curves(true_labels, logits, name, vis_dir)
-        
-        print(f"Result {name}: Acc={acc:.4f}, MacroF1={macro_f1:.4f}")
+        print(f"Result {name}: Acc={eval_results['accuracy']:.4f}, MacroF1={eval_results['macro_f1']:.4f}")
         
         del clf
         gc.collect()
@@ -887,16 +998,16 @@ def main(train_path='train.csv', val_path='validation.csv', output_dir='./output
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Emotion Classifier CLI")
-    parser.add_argument('--mode', choices=['train', 'inference', 'compress'], default='train', 
-                        help="Operation mode: 'train' (default), 'inference' (predict), or 'compress' (benchmark).")
-    parser.add_argument('--train', default='train.csv', 
-                        help="Path to training CSV file (default: train.csv).")
-    parser.add_argument('--val', default='validation.csv', 
-                        help="Path to validation CSV file (default: validation.csv).")
+    parser.add_argument('--mode', choices=['train', 'inference', 'compress', 'evaluate'], default='train', 
+                        help="Operation mode: 'train', 'inference', 'compress', or 'evaluate'.")
+    parser.add_argument('--train', default=DEFAULT_TRAIN_PATH, 
+                        help=f"Path to training CSV file (default: {DEFAULT_TRAIN_PATH}).")
+    parser.add_argument('--val', default=DEFAULT_VAL_PATH, 
+                        help=f"Path to validation CSV file (default: {DEFAULT_VAL_PATH}).")
     parser.add_argument('--test_csv', help="Path to test CSV file. Required for inference mode.")
-    parser.add_argument('--weights', help="Path to trained model checkpoint (.pt). Required for inference/compress.")
-    parser.add_argument('--output', default='./outputs', 
-                        help="Directory to save outputs (checkpoints, reports, plots).")
+    parser.add_argument('--weights', help="Path to trained model checkpoint (.pt). Required for inference/compress/evaluate.")
+    parser.add_argument('--output', default=DEFAULT_OUTPUT_DIR, 
+                        help=f"Directory to save outputs (default: {DEFAULT_OUTPUT_DIR}).")
     parser.add_argument('--model', choices=MODELS.keys(), 
                         help="Specific model architecture to use (optional). If omitted, trains all models.")
     parser.add_argument('--technique', default='all', choices=['prune', 'quantize', 'combined', 'all'],
@@ -911,6 +1022,10 @@ if __name__ == '__main__':
         if not args.weights or not args.test_csv:
             raise ValueError("Inference requires --weights and --test_csv")
         run_inference(args.weights, args.test_csv, args.model_id)
+    elif args.mode == 'evaluate':
+        if not args.weights or not args.val:
+            raise ValueError("Evaluation requires --weights and --val")
+        run_evaluation(args.weights, args.val, args.model_id, args.output)
     elif args.mode == 'compress':
         if not args.weights or not args.val:
             raise ValueError("Compression requires --weights and --val")
