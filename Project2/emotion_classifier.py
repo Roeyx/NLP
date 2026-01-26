@@ -9,7 +9,7 @@ Usage:
         python emotion_classifier.py --train train.csv --val validation.csv --output ./outputs
 
     Training (single model):
-        python emotion_classifier.py --model BERTweet --output ./outputs
+        python emotion_classifier.py --model CardiffRoBERTa --output ./outputs
 
     Inference on test set:
         python emotion_classifier.py --mode inference --weights outputs/best_CardiffRoBERTa.pt --test_csv test.csv
