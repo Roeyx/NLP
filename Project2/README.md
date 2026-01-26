@@ -15,9 +15,9 @@ pip install -r requirements.txt
 Ensure your input CSV has a column named **`text`** containing the tweets/sentences. Labels are not required.
 *Example `test.csv`:*
 ```csv
-id,text
-1,"I am feeling so happy today!"
-2,"This is actually quite terrifying."
+text
+"I am feeling so happy today!"
+"This is actually quite terrifying."
 ```
 
 ### 3. Run Inference
