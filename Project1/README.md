@@ -1,5 +1,7 @@
 # Emotion Detection Project (LSTM & GRU)
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Roeyx/NLP/blob/main/Project1/project1_workflow.ipynb)
+
 This repository implements an emotion classification pipeline using pretrained GloVe embeddings and recurrent neural networks (LSTM and GRU). The project compares two approaches:
 
 - **LSTM.py**: Baseline single-phase training with comprehensive grid search

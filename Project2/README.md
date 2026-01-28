@@ -1,5 +1,7 @@
 # Emotion Classification with BERT-based Models
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Roeyx/NLP/blob/main/Project2/emotion_classifier.ipynb)
+
 This repository contains the implementation for the paper "Emotion Classification with BERT-based Models". It provides a pipeline for fine-tuning Transformer models (BERTweet, CardiffRoBERTa, ModernBERT) on 6-class emotion recognition, along with compression techniques (Pruning + Quantization).
 pt files can be used and download via google drive link in emotion_classifier.ipynb
 
