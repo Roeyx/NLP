@@ -12,6 +12,8 @@ Both projects use the same 6-class emotion dataset:
 
 **Directory:** `Project1/`
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Roeyx/NLP/blob/main/Project1/project1_workflow.ipynb)
+
 This project implements and compares Recurrent Neural Network architectures using **GloVe Twitter embeddings** (100d). It focuses on architectural baselines and training strategies.
 
 ### Key Features
@@ -32,6 +34,8 @@ This project implements and compares Recurrent Neural Network architectures usin
 ## [Project 2: Transformers & Model Compression](./Project2/README.md)
 
 **Directory:** `Project2/`
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Roeyx/NLP/blob/main/Project2/emotion_classifier.ipynb)
 
 This project leverages state-of-the-art **Transformer models** (BERT-based) for the same classification task. It emphasizes model comparison and efficiency through compression techniques.
 
