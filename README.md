@@ -1,6 +1,21 @@
-# NLP Emotion Classification Projects
+# Emotion Classification with RNNs and Transformers
 
-This repository contains two distinct projects focusing on **Emotion Classification** from text data (tweets/sentences). The projects explore different generations of NLP architectures, ranging from Recurrent Neural Networks (RNNs) with static embeddings to modern Transformer-based models with compression techniques.
+A set of NLP projects for classifying emotions in text using both classical RNN-based models and modern transformer architectures.
+
+The repository explores model design, fine-tuning, and compression techniques across multiple architectures, including LSTM, GRU, and BERT-based models.
+
+**Tech:** Python, PyTorch, TensorFlow, HuggingFace Transformers
+
+--- 
+
+## What Is Implemented
+- Bidirectional LSTM and GRU models with GloVe embeddings
+- Transformer-based classifiers using BERT variants
+- Fine-tuning pipelines for pre-trained models
+- Hyperparameter search and structured experiments
+- Model compression using pruning and quantization
+
+--- 
 
 Both projects use the same 6-class emotion dataset:
 - **Labels**: 0: Sadness, 1: Joy, 2: Love, 3: Anger, 4: Fear, 5: Surprise
